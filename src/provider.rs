@@ -1,0 +1,1666 @@
+//! Subscription-backed CLI bridges. No credentials are read, copied, or persisted here.
+//! Wire references (reviewed 2026-10-02):
+//! https://developers.openai.com/codex/app-server
+//! https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol/schema/typescript/v2
+//! https://code.claude.com/docs/en/cli-reference
+//! https://code.claude.com/docs/en/headless
+//! https://github.com/anthropics/claude-agent-sdk-python/tree/main/src/claude_agent_sdk/_internal
+//! The Claude wire format is implemented against the unmodified CLI, not the SDK.
+
+use crate::model::{Backup, MAX_MESSAGE_BYTES, Message, Project, Provider, Session, new_id};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, Read, Write},
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+const MAX_LINE: usize = 1024 * 1024;
+const MAX_EVENT: usize = 16 * 1024;
+const POLL: Duration = Duration::from_millis(25);
+const GRACE: Duration = Duration::from_secs(2);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+const CANCELLED: &str = "Run cancelled";
+
+#[derive(Clone, Debug)]
+pub struct RunConfig {
+    pub provider: Provider,
+    pub executable: String,
+    pub cwd: String,
+    pub model: String,
+    pub remote_id: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderEvent {
+    Started { remote_id: String },
+    Text(String),
+    Tool(String),
+    Approval { id: String, description: String },
+    Usage(String),
+    Models(Vec<String>),
+    Done,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum ProviderCommand {
+    Approve { id: String, allow: bool },
+    Cancel,
+}
+
+pub struct Handle {
+    pub events: Receiver<ProviderEvent>,
+    pub commands: SyncSender<ProviderCommand>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Handle {
+    /// Nonblocking cancellation, including while the output queue is backpressured.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.commands.try_send(ProviderCommand::Cancel);
+    }
+}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Returns immediately; process discovery, authentication checks, and I/O run off the UI thread.
+pub fn start(config: RunConfig) -> Result<Handle, String> {
+    validate(&config)?;
+    let (event_tx, events) = mpsc::sync_channel(256);
+    let (commands, command_rx) = mpsc::sync_channel(16);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    thread::Builder::new()
+        .name("spark-provider".into())
+        .spawn(move || {
+            let sink = EventSink {
+                tx: event_tx,
+                cancelled: signal.clone(),
+            };
+            let result = match config.provider {
+                Provider::Codex => run_codex(&config, &sink, &command_rx, &signal),
+                Provider::Claude => run_claude(&config, &sink, &command_rx, &signal),
+            };
+            if let Err(error) = result {
+                if error != CANCELLED {
+                    let _ = sink.tx.try_send(ProviderEvent::Error(error));
+                }
+            }
+            let _ = sink.tx.try_send(ProviderEvent::Done);
+        })
+        .map_err(|_| "Could not start provider worker".to_string())?;
+    Ok(Handle {
+        events,
+        commands,
+        cancelled,
+    })
+}
+
+fn validate(config: &RunConfig) -> Result<(), String> {
+    if config.executable.trim().is_empty() || config.executable.contains(['\0', '\n', '\r']) {
+        return Err("Choose an installed CLI executable in Settings".into());
+    }
+    if config.cwd.is_empty() || config.cwd.contains('\0') {
+        return Err("Choose a project folder".into());
+    }
+    if config.prompt.trim().is_empty() {
+        return Err("Enter a message first".into());
+    }
+    if config.prompt.len() > MAX_MESSAGE_BYTES {
+        return Err("Message exceeds the 512 KiB limit".into());
+    }
+    if config.model.len() > 256
+        || config
+            .remote_id
+            .as_ref()
+            .is_some_and(|s| s.len() > 256 || s.contains(['\0', '\n', '\r']))
+    {
+        return Err("Invalid model or session identifier".into());
+    }
+    Ok(())
+}
+
+struct EventSink {
+    tx: SyncSender<ProviderEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+impl EventSink {
+    fn emit(&self, mut event: ProviderEvent) -> Result<(), String> {
+        let start = Instant::now();
+        loop {
+            match self.tx.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(CANCELLED.into()),
+                Err(TrySendError::Full(value)) => event = value,
+            }
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(CANCELLED.into());
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                return Err("Output queue is full; the provider was stopped safely. Retry after the UI catches up".into());
+            }
+            thread::sleep(POLL);
+        }
+    }
+    fn text(&self, text: &str) -> Result<(), String> {
+        for part in chunks(text, MAX_EVENT) {
+            self.emit(ProviderEvent::Text(part.to_owned()))?;
+        }
+        Ok(())
+    }
+    fn tool(&self, text: &str) -> Result<(), String> {
+        self.emit(ProviderEvent::Tool(redact(&truncate(text, MAX_EVENT))))
+    }
+}
+
+#[derive(Debug)]
+enum Wire {
+    Json(Value),
+    Eof,
+    Error(&'static str),
+}
+
+/// Child ownership is per invocation. Never discovers, kills, or attaches to other processes.
+struct Transport {
+    child: Child,
+    incoming: Receiver<Wire>,
+    outgoing: Option<SyncSender<Value>>,
+}
+impl Transport {
+    fn spawn(executable: &str, cwd: &str, args: &[String]) -> Result<Self, String> {
+        let mut command = cli_command(executable)?;
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Leave CLI-owned subscription storage to the CLI. Never forward API billing
+        // overrides or externally supplied OAuth tokens to this subscription-only app.
+        for key in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            command.env_remove(key);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW; native executable only
+        }
+        let mut child = command.spawn().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "CLI or project folder not found. Install the official CLI yourself and select its executable in Settings".into(),
+            std::io::ErrorKind::PermissionDenied => "CLI or project folder permission denied".into(),
+            _ => "Could not launch the CLI. Check its executable and project folder".to_string(),
+        })?;
+        let stdout = child.stdout.take().ok_or("CLI stdout unavailable")?;
+        let stderr = child.stderr.take().ok_or("CLI stderr unavailable")?;
+        let mut stdin = child.stdin.take().ok_or("CLI stdin unavailable")?;
+        let (raw_tx, incoming) = mpsc::sync_channel(8);
+        let output_tx = raw_tx.clone();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_bounded_line(&mut reader, MAX_LINE) {
+                    Ok(Some(line)) if line.iter().all(u8::is_ascii_whitespace) => continue,
+                    Ok(Some(line)) => {
+                        let packet = match serde_json::from_slice::<Value>(&line) {
+                            Ok(value) if value.is_object() => Wire::Json(value),
+                            _ => Wire::Error(
+                                "CLI emitted malformed JSON; update the official CLI and retry",
+                            ),
+                        };
+                        let invalid = matches!(packet, Wire::Error(_));
+                        if output_tx.send(packet).is_err() || invalid {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = output_tx.send(Wire::Eof);
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = output_tx.send(Wire::Error(
+                            "CLI output exceeded 1 MiB per line or could not be read",
+                        ));
+                        break;
+                    }
+                }
+            }
+        });
+        // Drain but never display or retain stderr: authentication failures may contain
+        // headers, tokens, or private filesystem paths. Surface actionable safe errors.
+        thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut buf = [0_u8; 8192];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let (outgoing, writer_rx) = mpsc::sync_channel::<Value>(16);
+        thread::spawn(move || {
+            for value in writer_rx {
+                let mut bytes = match serde_json::to_vec(&value) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if bytes.len() > MAX_LINE {
+                    let _ = raw_tx.try_send(Wire::Error("Provider request exceeds 1 MiB"));
+                    break;
+                }
+                bytes.push(b'\n');
+                if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+                    let _ = raw_tx.try_send(Wire::Error("CLI input pipe closed"));
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            incoming,
+            outgoing: Some(outgoing),
+        })
+    }
+    fn send(&self, value: Value) -> Result<(), String> {
+        self.outgoing
+            .as_ref()
+            .ok_or("CLI input closed")?
+            .try_send(value)
+            .map_err(|_| "CLI input is busy or closed; run stopped safely".into())
+    }
+    fn next(&self) -> Result<Option<Value>, String> {
+        match self.incoming.recv_timeout(POLL) {
+            Ok(Wire::Json(v)) => Ok(Some(v)),
+            Ok(Wire::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => Err("CLI exited before completing the request. Check the official CLI login and version in a terminal".into()),
+            Ok(Wire::Error(e)) => Err(e.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        }
+    }
+    fn close(&mut self) {
+        self.outgoing.take();
+        let deadline = Instant::now() + GRACE;
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(POLL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.outgoing.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn cli_command(executable: &str) -> Result<Command, String> {
+    #[cfg(windows)]
+    {
+        // Native binaries avoid cmd.exe reparsing user values. Prefer .exe even
+        // when an npm batch shim appears earlier in PATH. No shell command strings.
+        if is_batch_path(executable) {
+            return Err("Windows batch shims are unsafe for runtime arguments. Select the official native .exe instead".into());
+        }
+        let path = Path::new(executable);
+        if path.extension().is_none() {
+            return Ok(Command::new(format!("{executable}.exe")));
+        }
+    }
+    Ok(Command::new(executable))
+}
+#[cfg(any(windows, test))]
+fn is_batch_path(path: &str) -> bool {
+    path.split(['/', '\\', ':']).any(|p| {
+        let p = p.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        p.ends_with(".cmd") || p.ends_with(".bat")
+    })
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut result = Vec::new();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok((!result.is_empty()).then_some(result));
+        }
+        let n = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        if result.len() + n > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line too long",
+            ));
+        }
+        let done = buf[n - 1] == b'\n';
+        result.extend_from_slice(&buf[..n]);
+        reader.consume(n);
+        if done {
+            return Ok(Some(result));
+        }
+    }
+}
+
+fn rpc(method: &str, id: u64, params: Value) -> Value {
+    json!({"method":method,"id":id,"params":params})
+}
+fn initialization() -> Value {
+    rpc(
+        "initialize",
+        0,
+        json!({"clientInfo":{"name":"spark_code","title":"Spark Code","version":env!("CARGO_PKG_VERSION")}}),
+    )
+}
+fn codex_thread(config: &RunConfig) -> Value {
+    // Enum spellings follow the generated protocol schema, not legacy docs examples.
+    let mut params = json!({"cwd":config.cwd,"modelProvider":"openai","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":"workspace-write"});
+    if !config.model.is_empty() {
+        params["model"] = config.model.clone().into();
+    }
+    let method = if let Some(id) = &config.remote_id {
+        params["threadId"] = id.clone().into();
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    rpc(method, 4, params)
+}
+fn codex_turn(config: &RunConfig, id: &str) -> Value {
+    let mut params = json!({"threadId":id,"cwd":config.cwd,"input":[{"type":"text","text":config.prompt,"text_elements":[]}],
+        "approvalPolicy":"untrusted","approvalsReviewer":"user","sandboxPolicy":{"type":"workspaceWrite","writableRoots":[config.cwd],"networkAccess":false,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}});
+    if !config.model.is_empty() {
+        params["model"] = config.model.clone().into();
+    }
+    rpc("turn/start", 5, params)
+}
+
+#[derive(Clone)]
+enum Approval {
+    Codex {
+        wire_id: Value,
+        permissions: Option<Value>,
+    },
+    Claude {
+        wire_id: String,
+        input: Value,
+    },
+}
+fn approval_response(approval: Approval, allow: bool) -> Value {
+    match approval {
+        Approval::Codex {
+            wire_id,
+            permissions: None,
+        } => json!({"id":wire_id,"result":{"decision":if allow {"accept"} else {"decline"}}}),
+        Approval::Codex {
+            wire_id,
+            permissions: Some(permissions),
+        } => {
+            json!({"id":wire_id,"result":{"permissions":if allow {permissions} else {json!({})},"scope":"turn"}})
+        }
+        Approval::Claude { wire_id, input } => {
+            json!({"type":"control_response","response":{"subtype":"success","request_id":wire_id,
+            "response":if allow {json!({"behavior":"allow","updatedInput":input})} else {json!({"behavior":"deny","message":"User declined this action"})}}})
+        }
+    }
+}
+fn commands(
+    rx: &Receiver<ProviderCommand>,
+    signal: &AtomicBool,
+    pending: &mut HashMap<String, Approval>,
+    transport: &Transport,
+) -> Result<bool, String> {
+    let mut cancel = signal.load(Ordering::Acquire);
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            ProviderCommand::Cancel => cancel = true,
+            ProviderCommand::Approve { id, allow } => {
+                if let Some(approval) = pending.remove(&id) {
+                    transport.send(approval_response(approval, allow))?;
+                }
+            }
+        }
+    }
+    Ok(cancel)
+}
+fn safe_error(value: &Value) -> String {
+    let text = value.to_string().to_ascii_lowercase();
+    if text.contains("unauthorized") || text.contains("auth") || text.contains("401") {
+        "Provider authentication failed. Sign in through the official CLI in a terminal, then retry"
+            .into()
+    } else if text.contains("ratelimit")
+        || text.contains("rate_limit")
+        || text.contains("usage_limit")
+        || text.contains("429")
+    {
+        "The provider reports a usage or rate limit. Check your subscription usage and retry after the reset".into()
+    } else if text.contains("model") {
+        "The provider rejected this model or configuration. Choose an available model, or leave Model blank".into()
+    } else {
+        "The provider reported an error. Run its official CLI in a terminal for private diagnostics; no raw credentials or error payloads are stored by Spark Code".into()
+    }
+}
+
+fn run_codex(
+    config: &RunConfig,
+    sink: &EventSink,
+    command_rx: &Receiver<ProviderCommand>,
+    signal: &AtomicBool,
+) -> Result<(), String> {
+    let mut transport = Transport::spawn(&config.executable, &config.cwd, &["app-server".into()])?;
+    transport.send(initialization())?;
+    let mut pending = HashMap::new();
+    let mut thread_id = String::new();
+    let mut turn_id = String::new();
+    let mut streamed = HashSet::new();
+    let mut items: HashMap<String, String> = HashMap::new();
+    let mut phase_start = Instant::now();
+    let mut running = false;
+    let mut cancelling: Option<Instant> = None;
+    loop {
+        if commands(command_rx, signal, &mut pending, &transport)? && cancelling.is_none() {
+            if !thread_id.is_empty() && !turn_id.is_empty() {
+                let _ = transport.send(rpc(
+                    "turn/interrupt",
+                    99,
+                    json!({"threadId":thread_id,"turnId":turn_id}),
+                ));
+            }
+            for (_, approval) in pending.drain() {
+                let _ = transport.send(approval_response(approval, false));
+            }
+            cancelling = Some(Instant::now());
+        }
+        if cancelling.is_some_and(|t| t.elapsed() >= GRACE) {
+            return Err(CANCELLED.into());
+        }
+        if !running && cancelling.is_none() && phase_start.elapsed() > HANDSHAKE_TIMEOUT {
+            return Err("Codex did not finish initialization. Update the official CLI, check login, and retry".into());
+        }
+        let value = match transport.next() {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(_) if cancelling.is_some() => return Err(CANCELLED.into()),
+            Err(e) => return Err(e),
+        };
+        if let Some(method) = value["method"].as_str() {
+            let p = &value["params"];
+            if let Some(wire_id) = value.get("id") {
+                if cancelling.is_some() {
+                    let _ = transport.send(
+                        json!({"id":wire_id,"error":{"code":-32000,"message":"Run cancelled"}}),
+                    );
+                    continue;
+                }
+                let approval = match method {
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                        Some(Approval::Codex {
+                            wire_id: wire_id.clone(),
+                            permissions: None,
+                        })
+                    }
+                    "item/permissions/requestApproval" => Some(Approval::Codex {
+                        wire_id: wire_id.clone(),
+                        permissions: Some(p["permissions"].clone()),
+                    }),
+                    _ => None,
+                };
+                if let Some(approval) = approval {
+                    if p["threadId"].as_str() != Some(thread_id.as_str())
+                        || (!turn_id.is_empty() && p["turnId"].as_str() != Some(turn_id.as_str()))
+                        || pending.len() >= 32
+                    {
+                        transport.send(approval_response(approval, false))?;
+                        continue;
+                    }
+                    if method == "item/fileChange/requestApproval"
+                        && !p["itemId"]
+                            .as_str()
+                            .is_some_and(|id| items.contains_key(id))
+                    {
+                        transport.send(approval_response(approval, false))?;
+                        sink.tool("File approval denied: the provider did not supply a displayable change preview")?;
+                        continue;
+                    }
+                    let id = format!("codex:{}", wire_id);
+                    let item = p["itemId"]
+                        .as_str()
+                        .and_then(|i| items.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    let description = format!("{method}\n{}\n{item}", display_json(p));
+                    // Never approve details the UI could not display in full.
+                    if description.len() > MAX_EVENT {
+                        transport.send(approval_response(approval, false))?;
+                        sink.tool("Approval denied: details exceeded the display limit. Review the action in the official CLI")?;
+                        continue;
+                    }
+                    pending.insert(id.clone(), approval);
+                    sink.emit(ProviderEvent::Approval { id, description })?;
+                } else {
+                    // Unsupported interactive requests fail closed rather than hang or auto-approve.
+                    transport.send(json!({"id":wire_id,"error":{"code":-32601,"message":"Spark Code does not support this interactive request; use the official CLI"}}))?;
+                    sink.tool(
+                        "A provider interaction requires the official CLI; no action was approved",
+                    )?;
+                }
+                continue;
+            }
+            if p["threadId"]
+                .as_str()
+                .is_some_and(|id| !thread_id.is_empty() && id != thread_id)
+            {
+                continue;
+            }
+            match method {
+                "turn/started" => {
+                    if let Some(id) = p["turn"]["id"].as_str() {
+                        turn_id = id.into();
+                        running = true;
+                        if cancelling.is_some() {
+                            let _ = transport.send(rpc(
+                                "turn/interrupt",
+                                99,
+                                json!({"threadId":thread_id,"turnId":turn_id}),
+                            ));
+                        }
+                    }
+                }
+                "item/agentMessage/delta" if cancelling.is_none() => {
+                    if let Some(id) = p["itemId"].as_str() {
+                        if streamed.len() < 4096 {
+                            streamed.insert(id.to_owned());
+                        }
+                    }
+                    if let Some(text) = p["delta"].as_str() {
+                        sink.text(text)?;
+                    }
+                }
+                "item/started" | "item/completed" => {
+                    let item = &p["item"];
+                    let kind = item["type"].as_str().unwrap_or("");
+                    if kind == "agentMessage" && method == "item/completed" {
+                        if !streamed.contains(item["id"].as_str().unwrap_or("")) {
+                            if let Some(text) = item["text"].as_str() {
+                                sink.text(text)?;
+                            }
+                        }
+                    } else if !matches!(kind, "userMessage" | "agentMessage" | "reasoning") {
+                        let preview = display_json(item);
+                        if items.len() < 128 {
+                            if let Some(id) = item["id"].as_str() {
+                                items.insert(id.into(), truncate(&preview, MAX_EVENT));
+                            }
+                        }
+                        sink.tool(&format!("{method}: {preview}"))?;
+                    }
+                }
+                "item/commandExecution/outputDelta" => {
+                    if let Some(text) = p["delta"].as_str() {
+                        sink.tool(text)?;
+                    }
+                }
+                "turn/diff/updated" => {
+                    if let Some(diff) = p["diff"].as_str() {
+                        sink.tool(&format!("Changes:\n{diff}"))?;
+                    }
+                }
+                "thread/tokenUsage/updated" => sink.emit(ProviderEvent::Usage(token_usage(p)))?,
+                "account/rateLimits/updated" => sink.emit(ProviderEvent::Usage(rate_usage(p)))?,
+                "serverRequest/resolved" => {
+                    pending.remove(&format!("codex:{}", p["requestId"]));
+                }
+                "error" => {
+                    if p["willRetry"] == true {
+                        sink.tool("Codex reported a recoverable error and is retrying")?;
+                    } else {
+                        return Err(safe_error(p));
+                    }
+                }
+                "turn/completed" => {
+                    if p["turn"]["status"] == "failed" {
+                        sink.emit(ProviderEvent::Error(safe_error(&p["turn"]["error"])))?;
+                    }
+                    pending.clear();
+                    transport.close();
+                    return Ok(());
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(id) = value["id"].as_u64() else {
+            continue;
+        };
+        if value.get("error").is_some() {
+            if matches!(id, 2 | 3 | 99) {
+                if id != 99 {
+                    sink.emit(ProviderEvent::Usage(
+                        "This CLI version did not provide model or usage information".into(),
+                    ))?;
+                }
+                continue;
+            }
+            return Err(safe_error(&value["error"]));
+        }
+        if cancelling.is_some() {
+            continue;
+        }
+        let result = &value["result"];
+        match id {
+            0 => {
+                transport.send(json!({"method":"initialized","params":{}}))?;
+                transport.send(rpc("account/read", 1, json!({"refreshToken":false})))?;
+                phase_start = Instant::now();
+            }
+            1 => {
+                if result["account"]["type"] != "chatgpt" {
+                    return Err("Codex requires a ChatGPT subscription login. Run `codex login` in a terminal and choose ChatGPT. API-key and external-token modes are not used".into());
+                }
+                let plan = result["account"]["planType"]
+                    .as_str()
+                    .unwrap_or("connected");
+                sink.emit(ProviderEvent::Usage(format!(
+                    "ChatGPT subscription: {}",
+                    redact(plan)
+                )))?;
+                transport.send(rpc("model/list", 2, json!({"limit":100})))?;
+                transport.send(rpc("account/rateLimits/read", 3, json!({})))?;
+                transport.send(codex_thread(config))?;
+                phase_start = Instant::now();
+            }
+            2 => sink.emit(ProviderEvent::Models(model_names(result)))?,
+            3 => sink.emit(ProviderEvent::Usage(rate_usage(result)))?,
+            4 => {
+                thread_id = result["thread"]["id"]
+                    .as_str()
+                    .ok_or("Codex returned no thread identifier")?
+                    .into();
+                sink.emit(ProviderEvent::Started {
+                    remote_id: thread_id.clone(),
+                })?;
+                transport.send(codex_turn(config, &thread_id))?;
+                phase_start = Instant::now();
+            }
+            5 => {
+                turn_id = result["turn"]["id"]
+                    .as_str()
+                    .ok_or("Codex returned no turn identifier")?
+                    .into();
+                running = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn claude_args(config: &RunConfig) -> Vec<String> {
+    let mut args = vec![
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--permission-mode",
+        "default",
+        "--permission-prompt-tool",
+        "stdio",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<Vec<_>>();
+    // Equals form prevents a dash-leading model/session value becoming a new flag.
+    if !config.model.is_empty() {
+        args.push(format!("--model={}", config.model));
+    }
+    if let Some(id) = &config.remote_id {
+        args.push(format!("--resume={id}"));
+    }
+    args
+}
+fn claude_control(id: &str, request: Value) -> Value {
+    json!({"type":"control_request","request_id":id,"request":request})
+}
+
+fn claude_auth(
+    config: &RunConfig,
+    signal: &AtomicBool,
+    commands: &Receiver<ProviderCommand>,
+) -> Result<(), String> {
+    // `auth status` may be pretty-printed JSON, so capture a bounded stream in a
+    // dedicated reader, never Command::output() with an unbounded allocation.
+    let mut cmd = cli_command(&config.executable)?;
+    cmd.args(["auth", "status"])
+        .current_dir(&config.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        cmd.env_remove(key);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let child = cmd.spawn().map_err(|_| "Claude Code was not found. Install its official native CLI yourself and choose the executable in Settings".to_string())?;
+    let mut owned = AuthChild(child);
+    let stdout = owned
+        .0
+        .stdout
+        .take()
+        .ok_or("Claude auth status stdout unavailable")?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take((MAX_LINE + 1) as u64).read_to_end(&mut bytes);
+        let _ = tx.send((result.is_ok(), bytes));
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let bytes = loop {
+        if signal.load(Ordering::Acquire)
+            || matches!(commands.try_recv(), Ok(ProviderCommand::Cancel))
+        {
+            return Err(CANCELLED.into());
+        }
+        match rx.recv_timeout(POLL) {
+            Ok((true, b)) if b.len() <= MAX_LINE => break b,
+            Ok(_) => return Err("Claude auth status was unreadable or oversized".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Claude auth status failed".into());
+            }
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            return Err(
+                "Claude auth status timed out. Check the official CLI in a terminal".into(),
+            );
+        }
+    };
+    let result: Value = serde_json::from_slice(&bytes).map_err(|_| "This Claude CLI does not expose a recognized auth status. Update the official CLI and retry".to_string())?;
+    if result["loggedIn"] != true || result["authMethod"] != "claude.ai" {
+        return Err("Claude requires its own subscription login. Run `claude auth login` in a terminal. API keys, API-key helpers, external OAuth tokens, and third-party billing are not used".into());
+    }
+    Ok(())
+}
+struct AuthChild(Child);
+impl Drop for AuthChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn run_claude(
+    config: &RunConfig,
+    sink: &EventSink,
+    command_rx: &Receiver<ProviderCommand>,
+    signal: &AtomicBool,
+) -> Result<(), String> {
+    claude_auth(config, signal, command_rx)?;
+    sink.emit(ProviderEvent::Usage(
+        "Claude subscription connected; quota percentages are not provided by the CLI stream"
+            .into(),
+    ))?;
+    let mut transport = Transport::spawn(&config.executable, &config.cwd, &claude_args(config))?;
+    transport.send(claude_control(
+        "spark-init",
+        json!({"subtype":"initialize","hooks":null}),
+    ))?;
+    let mut pending = HashMap::new();
+    let mut initialized = false;
+    let mut seen_session = false;
+    let mut streamed_message = false;
+    let mut got_text = false;
+    let start = Instant::now();
+    let mut cancelling: Option<Instant> = None;
+    loop {
+        if commands(command_rx, signal, &mut pending, &transport)? && cancelling.is_none() {
+            for (_, approval) in pending.drain() {
+                let _ = transport.send(approval_response(approval, false));
+            }
+            let _ = transport.send(claude_control("spark-stop", json!({"subtype":"interrupt"})));
+            cancelling = Some(Instant::now());
+        }
+        if cancelling.is_some_and(|t| t.elapsed() >= GRACE) {
+            return Err(CANCELLED.into());
+        }
+        if !initialized && start.elapsed() > HANDSHAKE_TIMEOUT {
+            return Err(
+                "Claude did not initialize its stream. Update the official CLI and retry".into(),
+            );
+        }
+        let value = match transport.next() {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(_) if cancelling.is_some() => return Err(CANCELLED.into()),
+            Err(e) => return Err(e),
+        };
+        if !seen_session {
+            if let Some(id) = value["session_id"].as_str().filter(|id| !id.is_empty()) {
+                sink.emit(ProviderEvent::Started {
+                    remote_id: id.into(),
+                })?;
+                seen_session = true;
+            }
+        }
+        match value["type"].as_str().unwrap_or("") {
+            "control_response" if value["response"]["request_id"] == "spark-init" => {
+                if value["response"]["subtype"] == "error" {
+                    return Err("Claude does not support the required CLI control protocol. Update the official CLI".into());
+                }
+                if cancelling.is_none() {
+                    let models = value["response"]["response"]["models"]
+                        .as_array()
+                        .map(|m| {
+                            m.iter()
+                                .filter_map(|v| {
+                                    v["value"]
+                                        .as_str()
+                                        .or_else(|| v["id"].as_str())
+                                        .map(str::to_owned)
+                                })
+                                .take(100)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if !models.is_empty() {
+                        sink.emit(ProviderEvent::Models(models))?;
+                    }
+                    transport.send(json!({"type":"user","session_id":config.remote_id.as_deref().unwrap_or(""),"parent_tool_use_id":null,"message":{"role":"user","content":config.prompt}}))?;
+                    initialized = true;
+                }
+            }
+            "control_request" => {
+                let Some(id) = value["request_id"].as_str() else {
+                    continue;
+                };
+                let request = &value["request"];
+                if request["subtype"] == "can_use_tool" {
+                    let approval = Approval::Claude {
+                        wire_id: id.into(),
+                        input: request["input"].clone(),
+                    };
+                    let description = format!(
+                        "{}\n{}",
+                        request["tool_name"].as_str().unwrap_or("Tool action"),
+                        display_json(request)
+                    );
+                    if cancelling.is_some() || pending.len() >= 32 || description.len() > MAX_EVENT
+                    {
+                        transport.send(approval_response(approval, false))?;
+                        sink.tool("Tool approval denied because the request was cancelled, oversized, or exceeded the pending limit")?;
+                    } else {
+                        let key = format!("claude:{id}");
+                        pending.insert(key.clone(), approval);
+                        sink.emit(ProviderEvent::Approval {
+                            id: key,
+                            description,
+                        })?;
+                    }
+                } else {
+                    transport.send(json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"Unsupported interactive request; use the official Claude CLI"}}))?;
+                }
+            }
+            "control_cancel_request" => {
+                if let Some(id) = value["request_id"].as_str() {
+                    pending.remove(&format!("claude:{id}"));
+                }
+            }
+            "stream_event" if value["parent_tool_use_id"].is_null() => {
+                let event = &value["event"];
+                if event["type"] == "message_start" {
+                    streamed_message = false;
+                }
+                if event["delta"]["type"] == "text_delta" {
+                    if let Some(text) = event["delta"]["text"].as_str() {
+                        sink.text(text)?;
+                        streamed_message = true;
+                        got_text = true;
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(parts) = value["message"]["content"].as_array() {
+                    for part in parts {
+                        match part["type"].as_str() {
+                            Some("text")
+                                if !streamed_message && value["parent_tool_use_id"].is_null() =>
+                            {
+                                if let Some(text) = part["text"].as_str() {
+                                    sink.text(text)?;
+                                    got_text = true;
+                                }
+                            }
+                            Some("tool_use") => sink.tool(&format!(
+                                "{}: {}",
+                                part["name"].as_str().unwrap_or("Tool"),
+                                display_json(&part["input"])
+                            ))?,
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(error) = value.get("error") {
+                    sink.emit(ProviderEvent::Error(safe_error(error)))?;
+                }
+            }
+            "system" if value["subtype"] == "permission_denied" => {
+                sink.tool("Claude denied an action under its permission policy")?
+            }
+            "result" => {
+                if value["is_error"] == true {
+                    sink.emit(ProviderEvent::Error(safe_error(&value)))?;
+                } else if !got_text {
+                    if let Some(text) = value["result"].as_str() {
+                        sink.text(text)?;
+                    }
+                }
+                sink.emit(ProviderEvent::Usage(claude_usage(&value)))?;
+                if value["permission_denials"]
+                    .as_array()
+                    .is_some_and(|d| !d.is_empty())
+                {
+                    sink.tool("One or more tool actions were denied; see the official CLI for permission configuration")?;
+                }
+                pending.clear();
+                transport.close();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn token_usage(v: &Value) -> String {
+    let usage = &v["tokenUsage"]["total"];
+    format!(
+        "Session tokens: input {}, output {}",
+        usage["inputTokens"].as_u64().unwrap_or(0),
+        usage["outputTokens"].as_u64().unwrap_or(0)
+    )
+}
+fn claude_usage(v: &Value) -> String {
+    format!(
+        "Turn tokens: input {}, output {} (usage reported by Claude CLI; not a quota percentage)",
+        v["usage"]["input_tokens"].as_u64().unwrap_or(0),
+        v["usage"]["output_tokens"].as_u64().unwrap_or(0)
+    )
+}
+fn rate_usage(v: &Value) -> String {
+    let limits = &v["rateLimits"];
+    let mut windows = Vec::new();
+    for name in ["primary", "secondary"] {
+        let w = &limits[name];
+        if let Some(percent) = w["usedPercent"].as_f64() {
+            let reset = w["resetsAt"]
+                .as_i64()
+                .map(|v| format!(", reset Unix {v}"))
+                .unwrap_or_default();
+            windows.push(format!("{name}: {percent:.0}% used{reset}"));
+        }
+    }
+    if windows.is_empty() {
+        "Subscription rate limits unavailable from this CLI/account".into()
+    } else {
+        windows.join(" · ")
+    }
+}
+fn model_names(v: &Value) -> Vec<String> {
+    v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|v| v["hidden"] != true)
+                .filter_map(|v| {
+                    v["model"]
+                        .as_str()
+                        .or_else(|| v["id"].as_str())
+                        .filter(|s| s.len() <= 256)
+                        .map(str::to_owned)
+                })
+                .take(100)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.into();
+    }
+    let end = s.floor_char_boundary(max.saturating_sub(32));
+    format!("{}\n[display truncated]", &s[..end])
+}
+fn chunks(s: &str, max: usize) -> Vec<&str> {
+    let mut rest = s;
+    let mut out = Vec::new();
+    while rest.len() > max {
+        let n = rest.floor_char_boundary(max);
+        out.push(&rest[..n]);
+        rest = &rest[n..];
+    }
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+fn redact(text: &str) -> String {
+    let mut result = String::new();
+    let mut redact_next = false;
+    for word in text.split_inclusive(char::is_whitespace) {
+        let lower = word.to_ascii_lowercase();
+        let secret = redact_next
+            || lower.contains("sk-ant-")
+            || lower.contains("sk-proj-")
+            || lower.starts_with("sk-")
+            || lower.starts_with("eyj")
+            || ["api_key=", "token=", "password=", "authorization="]
+                .iter()
+                .any(|p| lower.contains(p));
+        redact_next = lower.trim_end() == "bearer";
+        if secret {
+            result.push_str("[redacted]");
+            if word.ends_with(char::is_whitespace) {
+                result.push(' ');
+            }
+        } else {
+            result.push_str(word);
+        }
+    }
+    result
+}
+fn display_json(value: &Value) -> String {
+    fn clean(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, v)| {
+                        let lower = k.to_ascii_lowercase();
+                        let sensitive = [
+                            "token",
+                            "secret",
+                            "password",
+                            "apikey",
+                            "api_key",
+                            "authorization",
+                            "credential",
+                        ]
+                        .iter()
+                        .any(|p| lower.contains(p));
+                        (
+                            k.clone(),
+                            if sensitive {
+                                Value::String("[redacted]".into())
+                            } else {
+                                clean(v)
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(clean).collect()),
+            Value::String(s) => Value::String(redact(s)),
+            _ => v.clone(),
+        }
+    }
+    serde_json::to_string_pretty(&clean(value)).unwrap_or_default()
+}
+
+/// Explicit, read-only history import for one project. Run this on a background
+/// thread only after an import click; normal startup never calls thread/list/read.
+/// Existing provider files are never accessed by this application.
+pub fn import_codex(executable: String, cwd: String) -> Result<Backup, String> {
+    if !Path::new(&cwd).is_dir() {
+        return Err("Select an existing project folder first".into());
+    }
+    let mut transport = Transport::spawn(&executable, &cwd, &["app-server".into()])?;
+    let mut seq = 0;
+    transport.send(initialization())?;
+    import_response(&transport, seq)?;
+    transport.send(json!({"method":"initialized","params":{}}))?;
+    let project = Project {
+        id: new_id(),
+        name: Path::new(&cwd)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Imported project".into()),
+        path: cwd.clone(),
+    };
+    let mut backup = Backup {
+        format: "spark-code".into(),
+        version: 1,
+        projects: vec![project.clone()],
+        sessions: vec![],
+        messages: vec![],
+    };
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    let mut cursors = HashSet::new();
+    let mut bytes = 0;
+    loop {
+        seq += 1;
+        transport.send(rpc(
+            "thread/list",
+            seq,
+            json!({"cwd":cwd,"limit":50,"cursor":cursor,"archived":false,"sourceKinds":["cli","vscode","exec","appServer","unknown"]}),
+        ))?;
+        let page = import_response(&transport, seq)?;
+        let data = page["data"]
+            .as_array()
+            .ok_or("Codex returned an invalid thread list")?;
+        for record in data {
+            let Some(id) = record["id"].as_str() else {
+                continue;
+            };
+            if !seen.insert(id.to_owned()) {
+                continue;
+            }
+            if seen.len() > 200 {
+                return Err("This project has more than 200 Codex sessions; use a smaller explicit export instead".into());
+            }
+            seq += 1;
+            transport.send(rpc(
+                "thread/read",
+                seq,
+                json!({"threadId":id,"includeTurns":true}),
+            ))?;
+            let read = import_response(&transport, seq)?;
+            let t = &read["thread"];
+            let mut session = Session::new(
+                project.id.clone(),
+                Provider::Codex,
+                t["model"].as_str().unwrap_or("").into(),
+            );
+            session.remote_id = Some(id.into());
+            session.title = truncate(
+                t["name"]
+                    .as_str()
+                    .or_else(|| t["preview"].as_str())
+                    .unwrap_or("Imported Codex conversation"),
+                160,
+            );
+            session.updated = t["updatedAt"].as_i64().unwrap_or(session.updated);
+            if let Some(turns) = t["turns"].as_array() {
+                for turn in turns {
+                    if let Some(items) = turn["items"].as_array() {
+                        for item in items {
+                            let (role, text) = match item["type"].as_str() {
+                                Some("agentMessage") => {
+                                    ("assistant", item["text"].as_str().unwrap_or("").to_owned())
+                                }
+                                Some("userMessage") => (
+                                    "user",
+                                    item["content"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|p| p["text"].as_str())
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        })
+                                        .unwrap_or_default(),
+                                ),
+                                _ => continue,
+                            };
+                            if text.is_empty() {
+                                continue;
+                            }
+                            bytes += text.len();
+                            if text.len() > MAX_MESSAGE_BYTES
+                                || bytes > 16 * 1024 * 1024
+                                || backup.messages.len() >= 10000
+                            {
+                                return Err("Codex import exceeded safe history limits; use a smaller explicit export instead".into());
+                            }
+                            backup.messages.push(Message::new(&session.id, role, text));
+                        }
+                    }
+                }
+            }
+            backup.sessions.push(session);
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if let Some(c) = &cursor {
+            if !cursors.insert(c.clone()) {
+                return Err("Codex repeated a pagination cursor; import stopped".into());
+            }
+        } else {
+            break;
+        }
+    }
+    transport.close();
+    Ok(backup)
+}
+fn import_response(transport: &Transport, id: u64) -> Result<Value, String> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(v) = transport.next()? {
+            if v.get("method").is_some() {
+                if let Some(id) = v.get("id") {
+                    transport.send(json!({"id":id,"error":{"code":-32601,"message":"Read-only import cannot approve actions"}}))?;
+                }
+            } else if v["id"].as_u64() == Some(id) {
+                if v.get("error").is_some() {
+                    return Err(safe_error(&v["error"]));
+                }
+                return Ok(v["result"].clone());
+            }
+        }
+    }
+    Err("Codex history request timed out; no partial import was applied".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    static MOCK_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn config(provider: Provider) -> RunConfig {
+        RunConfig {
+            provider,
+            executable: provider.cli().into(),
+            cwd: "/tmp".into(),
+            model: String::new(),
+            remote_id: None,
+            prompt: "Hello; $(no shell)\nnext".into(),
+        }
+    }
+    #[test]
+    fn bounded_lines_reject_oversize() {
+        assert!(read_bounded_line(&mut std::io::Cursor::new(vec![b'x'; 10]), 9).is_err());
+        assert_eq!(
+            read_bounded_line(&mut std::io::Cursor::new(b"abc\nrest"), 4)
+                .unwrap()
+                .unwrap(),
+            b"abc\n"
+        );
+    }
+    #[test]
+    fn codex_schema_and_safe_permissions() {
+        let c = config(Provider::Codex);
+        let t = codex_thread(&c);
+        assert_eq!(t["params"]["sandbox"], "workspace-write");
+        assert_eq!(t["params"]["approvalPolicy"], "untrusted");
+        let turn = codex_turn(&c, "thread");
+        assert_eq!(turn["params"]["sandboxPolicy"]["networkAccess"], false);
+        assert_eq!(turn["params"]["input"][0]["text"], c.prompt);
+    }
+    #[test]
+    fn approvals_preserve_wire_id_and_never_grant_session() {
+        let a = Approval::Codex {
+            wire_id: json!(42),
+            permissions: None,
+        };
+        assert_eq!(
+            approval_response(a, true),
+            json!({"id":42,"result":{"decision":"accept"}})
+        );
+        let a = Approval::Claude {
+            wire_id: "r".into(),
+            input: json!({"command":"echo ok"}),
+        };
+        let v = approval_response(a, false);
+        assert_eq!(v["response"]["response"]["behavior"], "deny");
+        let a = Approval::Codex {
+            wire_id: json!("r"),
+            permissions: Some(json!({"network":true})),
+        };
+        assert_eq!(
+            approval_response(a, false)["result"]["permissions"],
+            json!({})
+        );
+    }
+    #[test]
+    fn flags_cannot_be_injected() {
+        let mut c = config(Provider::Claude);
+        c.model = "--dangerously-skip-permissions".into();
+        c.remote_id = Some("--dangerously-skip-permissions".into());
+        let args = claude_args(&c);
+        assert!(!args.contains(&"--dangerously-skip-permissions".into()));
+        assert!(args.contains(&"--resume=--dangerously-skip-permissions".into()));
+        assert!(!args.contains(&c.prompt));
+    }
+    #[test]
+    fn windows_batch_variants_rejected() {
+        for p in [
+            "claude.cmd",
+            "C:\\bin\\claude.CMD. ",
+            "a.cmd:stream",
+            "C:\\x.bat\\...\\..",
+        ] {
+            assert!(is_batch_path(p), "{p}");
+        }
+        assert!(!is_batch_path("C:\\bin\\claude.exe"));
+    }
+    #[test]
+    fn secrets_are_not_in_diagnostics() {
+        let raw = json!({"accessToken":"super-secret","nested":{"password":"dontshow"},"command":"curl -H Bearer sk-ant-abc"});
+        let text = display_json(&raw);
+        assert!(!text.contains("super-secret"));
+        assert!(!text.contains("dontshow"));
+        assert!(!text.contains("sk-ant-abc"));
+        assert!(!safe_error(&raw).contains("super-secret"));
+    }
+    #[test]
+    fn unicode_bounds_hold() {
+        let s = "💡".repeat(10000);
+        for p in chunks(&s, 100) {
+            assert!(p.len() <= 100);
+        }
+        assert_eq!(chunks(&s, 100).join(""), s);
+        assert!(truncate(&s, 100).len() <= 100);
+    }
+    #[test]
+    fn models_and_usage_are_real_protocol_fields() {
+        assert_eq!(
+            model_names(
+                &json!({"data":[{"id":"x","model":"official-model"},{"model":"hidden","hidden":true}]})
+            ),
+            vec!["official-model"]
+        );
+        assert!(
+            rate_usage(&json!({"rateLimits":{"primary":{"usedPercent":20,"resetsAt":100}}}))
+                .contains("20%")
+        );
+    }
+
+    #[cfg(unix)]
+    fn mock_cli(mode: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mock-cli");
+        let program = r#"#!/usr/bin/env python3
+import json, sys, os
+MODE = '__MODE__'
+def out(value):
+    data = json.dumps(value) + '\n'
+    # Split writes to prove framing is independent of read boundaries.
+    split = max(1, len(data)//2)
+    sys.stdout.write(data[:split]); sys.stdout.flush()
+    sys.stdout.write(data[split:]); sys.stdout.flush()
+def response(i, v): out({'id':i,'result':v})
+def event(method, params): out({'method':method,'params':params})
+if sys.argv[1:] == ['auth','status']:
+    print(json.dumps({'loggedIn':True,'authMethod':'api_key' if MODE == 'api' else 'claude.ai'}, indent=2))
+    sys.exit(0)
+for line in sys.stdin:
+    v=json.loads(line)
+    with open('wire.log','a') as f: f.write(json.dumps(v)+'\n')
+    method=v.get('method')
+    if MODE == 'malformed':
+        print('{not valid json sk-ant-secret}',flush=True); sys.exit(0)
+    if method == 'initialize': response(v['id'],{'userAgent':'mock'})
+    elif method == 'account/read': response(v['id'],{'account':{'type':'apiKey' if MODE == 'api' else 'chatgpt','planType':'plus'}})
+    elif method == 'model/list': response(v['id'],{'data':[{'model':'mock-model'}],'nextCursor':None})
+    elif method == 'account/rateLimits/read': response(v['id'],{'rateLimits':{'primary':{'usedPercent':12}}})
+    elif method in ('thread/start','thread/resume'):
+        assert v['params']['approvalPolicy']=='untrusted'
+        assert v['params']['sandbox']=='workspace-write'
+        response(v['id'],{'thread':{'id':'thread-mock'}})
+    elif method == 'turn/start':
+        assert v['params']['sandboxPolicy']['networkAccess'] is False
+        response(v['id'],{'turn':{'id':'turn-mock'}})
+        event('turn/started',{'threadId':'thread-mock','turn':{'id':'turn-mock'}})
+        event('item/agentMessage/delta',{'threadId':'thread-mock','itemId':'msg','delta':'Hello from mock'})
+        if MODE not in ('cancel', 'cancel-stuck'):
+            event('item/commandExecution/requestApproval',{'threadId':'thread-mock','turnId':'turn-mock','itemId':'cmd','command':'echo mock'}) if False else None
+            out({'id':47,'method':'item/commandExecution/requestApproval','params':{'threadId':'thread-mock','turnId':'turn-mock','itemId':'cmd','command':'echo mock'}})
+    elif method == 'turn/interrupt':
+        open('interrupted','w').write('yes')
+        if MODE == 'cancel-stuck': continue
+        response(v['id'],{})
+        event('turn/completed',{'threadId':'thread-mock','turn':{'id':'turn-mock','status':'interrupted'}})
+    elif v.get('id') == 47:
+        open('decision','w').write(v['result']['decision'])
+        event('item/completed',{'threadId':'thread-mock','item':{'id':'msg','type':'agentMessage','text':'Hello from mock'}})
+        event('turn/completed',{'threadId':'thread-mock','turn':{'id':'turn-mock','status':'completed'}})
+    elif method == 'thread/list': response(v['id'],{'data':[{'id':'historic'}],'nextCursor':None})
+    elif method == 'thread/read': response(v['id'],{'thread':{'id':'historic','name':'Saved test','turns':[{'items':[{'type':'userMessage','content':[{'type':'text','text':'Question'}]},{'type':'agentMessage','text':'Answer'}]}]}})
+    elif v.get('type') == 'control_request':
+        req=v['request']; rid=v['request_id']
+        out({'type':'control_response','response':{'subtype':'success','request_id':rid,'response':{'models':[{'value':'mock-claude'}]}}})
+        if req['subtype']=='interrupt': out({'type':'result','session_id':'claude-mock','is_error':False,'result':'','usage':{}})
+    elif v.get('type') == 'user':
+        out({'type':'system','subtype':'init','session_id':'claude-mock'})
+        out({'type':'stream_event','parent_tool_use_id':None,'event':{'type':'message_start'}})
+        out({'type':'stream_event','parent_tool_use_id':None,'event':{'delta':{'type':'text_delta','text':'Hello Claude'}}})
+        out({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'Hello Claude'}]}})
+        out({'type':'control_request','request_id':'permission-1','request':{'subtype':'can_use_tool','tool_name':'Bash','input':{'command':'echo test'}}})
+    elif v.get('type')=='control_response':
+        open('decision','w').write(v['response']['response']['behavior'])
+        out({'type':'result','session_id':'claude-mock','is_error':False,'result':'Hello Claude','usage':{'input_tokens':10,'output_tokens':3}})
+"#.replace("__MODE__", mode);
+        std::fs::write(&path, program).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, path.to_string_lossy().into_owned())
+    }
+    #[cfg(unix)]
+    fn mock_config(provider: Provider, dir: &tempfile::TempDir, executable: String) -> RunConfig {
+        RunConfig {
+            executable,
+            cwd: dir.path().to_string_lossy().into_owned(),
+            ..config(provider)
+        }
+    }
+    #[cfg(unix)]
+    fn until_done(handle: &Handle, allow: bool) -> Vec<ProviderEvent> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut events = Vec::new();
+        loop {
+            let ev = handle
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("worker should finish");
+            if let ProviderEvent::Approval { id, .. } = &ev {
+                handle
+                    .commands
+                    .try_send(ProviderCommand::Approve {
+                        id: id.clone(),
+                        allow,
+                    })
+                    .unwrap();
+            }
+            let done = matches!(ev, ProviderEvent::Done);
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+    #[cfg(unix)]
+    #[test]
+    fn codex_stdio_handshake_approval_stream_and_cleanup() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, exe) = mock_cli("normal");
+        let handle = start(mock_config(Provider::Codex, &dir, exe)).unwrap();
+        let events = until_done(&handle, true);
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Error(_))),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|e| if let ProviderEvent::Text(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                })
+                .collect::<String>(),
+            "Hello from mock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("decision")).unwrap(),
+            "accept"
+        );
+        let wire = std::fs::read_to_string(dir.path().join("wire.log")).unwrap();
+        assert!(!wire.contains("thread/list"));
+        assert!(!wire.contains("thread/read"));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e,ProviderEvent::Started{remote_id} if remote_id=="thread-mock"))
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn claude_stdio_auth_approval_and_deduplication() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, exe) = mock_cli("normal");
+        let handle = start(mock_config(Provider::Claude, &dir, exe)).unwrap();
+        let events = until_done(&handle, false);
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Error(_))),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|e| if let ProviderEvent::Text(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                })
+                .collect::<String>(),
+            "Hello Claude"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("decision")).unwrap(),
+            "deny"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn api_billing_modes_are_refused_before_prompt() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        for provider in [Provider::Codex, Provider::Claude] {
+            let (dir, exe) = mock_cli("api");
+            let handle = start(mock_config(provider, &dir, exe)).unwrap();
+            let events = until_done(&handle, false);
+            assert!(events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+            let wire = std::fs::read_to_string(dir.path().join("wire.log")).unwrap_or_default();
+            assert!(!wire.contains("turn/start"));
+            assert!(!wire.contains("\"type\": \"user\""));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_interrupts_only_its_owned_child() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir1, exe1) = mock_cli("cancel");
+        let (dir2, exe2) = mock_cli("normal");
+        let first = start(mock_config(Provider::Codex, &dir1, exe1)).unwrap();
+        let second = start(mock_config(Provider::Codex, &dir2, exe2)).unwrap();
+        loop {
+            if matches!(
+                first.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ProviderEvent::Text(_)
+            ) {
+                break;
+            }
+        }
+        first.cancel();
+        let a = until_done(&first, false);
+        assert!(
+            !a.iter().any(|e| matches!(e, ProviderEvent::Error(_))),
+            "{a:?}"
+        );
+        assert!(dir1.path().join("interrupted").exists());
+        let b = until_done(&second, true);
+        assert!(
+            !b.iter().any(|e| matches!(e, ProviderEvent::Error(_))),
+            "{b:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir2.path().join("decision")).unwrap(),
+            "accept"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_import_reads_history_without_resuming_or_inference() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, exe) = mock_cli("normal");
+        let backup = import_codex(exe, dir.path().to_string_lossy().into_owned()).unwrap();
+        assert_eq!(backup.sessions.len(), 1);
+        assert_eq!(backup.messages.len(), 2);
+        let wire = std::fs::read_to_string(dir.path().join("wire.log")).unwrap();
+        assert!(wire.contains("thread/list"));
+        assert!(wire.contains("thread/read"));
+        assert!(!wire.contains("thread/resume"));
+        assert!(!wire.contains("turn/start"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn malformed_output_fails_without_disclosing_payload() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, exe) = mock_cli("malformed");
+        let handle = start(mock_config(Provider::Codex, &dir, exe)).unwrap();
+        let events = until_done(&handle, false);
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+        assert!(!format!("{events:?}").contains("sk-ant-secret"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unresponsive_child_is_killed_after_grace_period() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, exe) = mock_cli("cancel-stuck");
+        let handle = start(mock_config(Provider::Codex, &dir, exe)).unwrap();
+        loop {
+            if matches!(
+                handle.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ProviderEvent::Text(_)
+            ) {
+                break;
+            }
+        }
+        let started = Instant::now();
+        handle.cancel();
+        let events = until_done(&handle, false);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(dir.path().join("interrupted").exists());
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+}
