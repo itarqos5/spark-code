@@ -120,13 +120,15 @@ try {
         $process.Refresh()
         if ($process.HasExited) { throw "GUI exited before opening a window with code $($process.ExitCode)" }
         $window = $process.MainWindowHandle
-        if ($window -ne [IntPtr]::Zero) { break }
+        # Winit creates the native handle before Iced applies the application
+        # title. Wait for the initialized main window, not merely its handle.
+        if ($window -ne [IntPtr]::Zero -and $process.MainWindowTitle -like 'Spark Code*') { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     Assert-OwnedWindow
     $report.guiOpened = $true
     $report['windowTitle'] = $process.MainWindowTitle
-    if ($process.MainWindowTitle -notlike 'Spark Code*') { throw 'Unexpected GUI window title' }
+    if ($process.MainWindowTitle -notlike 'Spark Code*') { throw "GUI title did not initialize within fifteen seconds: '$($process.MainWindowTitle)'" }
 
     $style = [SparkChromeTest.Native]::GetWindowLong($window, -16) # GWL_STYLE
     $required = 0x00040000 -bor 0x00020000 -bor 0x00010000 -bor 0x00080000
