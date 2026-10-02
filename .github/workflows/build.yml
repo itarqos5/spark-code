@@ -87,6 +87,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --target x86_64-pc-windows-msvc --all-targets
       - run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
+      - name: Preserve exact compiled Windows binaries for recovery
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spark-code-windows-binaries-${{ github.sha }}
+          path: |
+            target/x86_64-pc-windows-msvc/release/spark-code.exe
+            target/x86_64-pc-windows-msvc/release/spark-code-desktop.exe
+          if-no-files-found: error
+          retention-days: 7
       - name: Verify native branding and exact binary versions
         shell: pwsh
         run: |
