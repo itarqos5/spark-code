@@ -2,6 +2,9 @@ use crate::{
     model::*,
     model_catalog::ModelCatalog,
     provider::{self, Handle, ProviderCommand, ProviderEvent, RunConfig},
+    provider_status::{
+        AccessMode, ProviderStates, Readiness, TimelineEntry, TimelineKind, push_timeline,
+    },
     store::{Store, data_dir},
 };
 use std::{
@@ -10,6 +13,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::mpsc::TrySendError,
+    time::Instant,
 };
 const MAX_APPROVALS: usize = 32;
 
@@ -19,6 +23,7 @@ pub struct ActiveRun {
     pub status: String,
     pub approval: VecDeque<(String, String)>,
     pub usage: String,
+    pub started_at: Instant,
     failed: bool,
     canonical_path: PathBuf,
     provider: Provider,
@@ -34,6 +39,8 @@ pub struct Engine {
     pub notice: String,
     pub concurrency: usize,
     pub models: ModelCatalog,
+    pub providers: ProviderStates,
+    pub timelines: HashMap<String, VecDeque<TimelineEntry>>,
     lock_dir: PathBuf,
 }
 impl Engine {
@@ -54,6 +61,8 @@ impl Engine {
             notice: "Ready · providers start only when you send".into(),
             concurrency: 2,
             models: ModelCatalog::default(),
+            providers: ProviderStates::default(),
+            timelines: HashMap::new(),
             lock_dir: path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -93,8 +102,11 @@ impl Engine {
         self.projects.push(p);
         Ok(id)
     }
+    pub fn new_general_chat(&mut self) -> Result<String, String> {
+        self.new_session(String::new())
+    }
     pub fn new_session(&mut self, pid: String) -> Result<String, String> {
-        if !self.projects.iter().any(|p| p.id == pid) {
+        if !pid.is_empty() && !self.projects.iter().any(|p| p.id == pid) {
             return Err("Add or select a project folder first".into());
         }
         let s = Session::new(pid, self.settings.provider, self.settings.model.clone());
@@ -103,7 +115,41 @@ impl Engine {
         self.sessions.insert(0, s);
         Ok(id)
     }
+    pub fn probe_succeeded(&mut self, provider: Provider, info: provider::ProviderInfo) {
+        self.models.set(provider, info.models);
+        let state = self.providers.get_mut(provider);
+        state.readiness = Readiness::Ready;
+        state.status = info.status;
+        state.usage_windows = info.usage_windows;
+        state.usage_note = info.usage;
+        state.checked_at = now();
+        state.supported_efforts = info.supported_efforts;
+        state.model_efforts = info.model_efforts;
+        state.supported_access = info.supported_access;
+        state.tool_free_supported = info.tool_free_supported;
+    }
+    pub fn provider_failed(&mut self, provider: Provider, error: &str) {
+        self.providers.get_mut(provider).fail(error);
+    }
     pub fn send(&mut self, id: &str, prompt: String) -> Result<(), String> {
+        let access = if self
+            .sessions
+            .iter()
+            .any(|s| s.id == id && s.project_id.is_empty())
+        {
+            AccessMode::ReadOnly
+        } else {
+            AccessMode::Workspace
+        };
+        self.send_with_options(id, prompt, None, access)
+    }
+    pub fn send_with_options(
+        &mut self,
+        id: &str,
+        prompt: String,
+        effort: Option<String>,
+        access: AccessMode,
+    ) -> Result<(), String> {
         if prompt.trim().is_empty() {
             return Ok(());
         }
@@ -113,7 +159,7 @@ impl Engine {
         if self.jobs.contains_key(id) {
             return Err("This conversation is already running".into());
         }
-        if self.jobs.len() >= self.concurrency {
+        if self.jobs.len() >= self.concurrency.min(16) {
             return Err(format!(
                 "All {} agent slots are busy; wait or stop one",
                 self.concurrency
@@ -124,12 +170,46 @@ impl Engine {
             .iter()
             .find(|s| s.id == id)
             .ok_or("Conversation not found")?;
-        let p = self
-            .projects
-            .iter()
-            .find(|p| p.id == s.project_id)
-            .ok_or("Project not found")?;
-        let canonical = canonical_project(&p.path)?;
+        let state = self.providers.get(s.provider);
+        if !state.ready() {
+            return Err("Refresh this provider and sign in before sending".into());
+        }
+        if !s.model.is_empty() && !self.models.get(s.provider).contains(&s.model) {
+            return Err("This model was not returned by the current provider. Choose an available model before sending".into());
+        }
+        if !state.supported_access.contains(&access) {
+            return Err("This provider does not support the selected access mode. Choose an available mode such as Read-only".into());
+        }
+        if effort
+            .as_ref()
+            .is_some_and(|e| !state.efforts_for(&s.model).contains(e))
+        {
+            return Err("This model did not advertise the selected reasoning effort; choose Provider default".into());
+        }
+        let general = s.project_id.is_empty();
+        if general && access == AccessMode::ChatOnly && !state.tool_free_supported {
+            return Err("This provider has no verified all-tools-off mode".into());
+        }
+        let canonical = if general {
+            // A neutral, app-owned directory. Never use a previous project or the user's home.
+            // Hash the persisted identifier rather than treating imported IDs as paths.
+            let mut key = DefaultHasher::new();
+            s.id.hash(&mut key);
+            let path = self
+                .lock_dir
+                .join("general-chat")
+                .join(format!("{:016x}", key.finish()));
+            std::fs::create_dir_all(&path)
+                .map_err(|e| format!("Cannot create private chat workspace: {e}"))?;
+            canonical_project(&path.to_string_lossy())?
+        } else {
+            let p = self
+                .projects
+                .iter()
+                .find(|p| p.id == s.project_id)
+                .ok_or("Project not found")?;
+            canonical_project(&p.path)?
+        };
         if self
             .jobs
             .values()
@@ -149,6 +229,8 @@ impl Engine {
             model: s.model.clone(),
             remote_id: s.remote_id.clone(),
             prompt: prompt.clone(),
+            effort,
+            access,
         };
         if s.title == "New conversation" {
             s.title = prompt.chars().take(54).collect();
@@ -164,6 +246,22 @@ impl Engine {
             .unwrap() = s;
         let run_provider = config.provider;
         let handle = provider::start(config)?;
+        if !self.timelines.contains_key(id)
+            && self.timelines.len() >= 50
+            && let Some(old) = self
+                .timelines
+                .keys()
+                .find(|key| !self.jobs.contains_key(*key))
+                .cloned()
+        {
+            self.timelines.remove(&old);
+        }
+        let timeline = self.timelines.entry(id.into()).or_default();
+        push_timeline(
+            timeline,
+            TimelineEntry::new(TimelineKind::Status, "Turn started", &format!("{access}")),
+            0,
+        );
         self.jobs.insert(
             id.into(),
             ActiveRun {
@@ -172,6 +270,7 @@ impl Engine {
                 status: "Connecting".into(),
                 approval: VecDeque::new(),
                 usage: String::new(),
+                started_at: Instant::now(),
                 failed: false,
                 canonical_path: canonical,
                 provider: run_provider,
@@ -187,30 +286,30 @@ impl Engine {
         }
     }
     pub fn approve(&mut self, id: &str, allow: bool) {
-        if let Some(j) = self.jobs.get_mut(id) {
-            if let Some((aid, _)) = j.approval.front() {
-                match j.handle.commands.try_send(ProviderCommand::Approve {
-                    id: aid.clone(),
-                    allow,
-                }) {
-                    Ok(()) => {
-                        j.approval.pop_front();
-                        j.status = if !j.approval.is_empty() {
-                            "Needs your approval"
-                        } else if allow {
-                            "Running"
-                        } else {
-                            "Denied"
-                        }
-                        .into();
+        if let Some(j) = self.jobs.get_mut(id)
+            && let Some((aid, _)) = j.approval.front()
+        {
+            match j.handle.commands.try_send(ProviderCommand::Approve {
+                id: aid.clone(),
+                allow,
+            }) {
+                Ok(()) => {
+                    j.approval.pop_front();
+                    j.status = if !j.approval.is_empty() {
+                        "Needs your approval"
+                    } else if allow {
+                        "Running"
+                    } else {
+                        "Denied"
                     }
-                    Err(TrySendError::Full(_)) => {
-                        self.notice = "Approval queue is busy; please try again".into()
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        j.handle.cancel();
-                        self.notice = "Provider disconnected before receiving your approval".into();
-                    }
+                    .into();
+                }
+                Err(TrySendError::Full(_)) => {
+                    self.notice = "Approval queue is busy; please try again".into()
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    j.handle.cancel();
+                    self.notice = "Provider disconnected before receiving your approval".into();
                 }
             }
         }
@@ -223,6 +322,9 @@ impl Engine {
                 match j.handle.events.try_recv() {
                     Ok(ev) => {
                         changed = true;
+                        let elapsed_ms =
+                            j.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        let timeline = self.timelines.entry(id.clone()).or_default();
                         match ev {
                             ProviderEvent::Started { remote_id } => {
                                 if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == id) {
@@ -254,8 +356,35 @@ impl Engine {
                             }
                             ProviderEvent::Tool(t) => {
                                 j.status = t.chars().take(240).collect();
+                                push_timeline(
+                                    timeline,
+                                    TimelineEntry::new(
+                                        TimelineKind::Status,
+                                        "Provider activity",
+                                        &t,
+                                    ),
+                                    elapsed_ms,
+                                );
+                            }
+                            ProviderEvent::Timeline(entry) => {
+                                j.status = entry.label.clone();
+                                push_timeline(timeline, entry, elapsed_ms);
+                            }
+                            ProviderEvent::UsageSnapshot(windows) => {
+                                let state = self.providers.get_mut(j.provider);
+                                state.usage_windows = windows;
+                                state.checked_at = now();
                             }
                             ProviderEvent::Approval { id, description } => {
+                                push_timeline(
+                                    timeline,
+                                    TimelineEntry::new(
+                                        TimelineKind::Approval,
+                                        "Approval requested",
+                                        &description,
+                                    ),
+                                    elapsed_ms,
+                                );
                                 if let Err(error) = queue_approval(&mut j.approval, id, description)
                                 {
                                     self.notice = error;
@@ -266,13 +395,35 @@ impl Engine {
                                     j.status = "Needs your approval".into();
                                 }
                             }
-                            ProviderEvent::Usage(t) => j.usage = t,
+                            ProviderEvent::Usage(t) => {
+                                self.providers.get_mut(j.provider).usage_note = t.clone();
+                                j.usage = t;
+                            }
                             ProviderEvent::Models(models) => self.models.set(j.provider, models),
                             ProviderEvent::Done => {
+                                push_timeline(
+                                    timeline,
+                                    TimelineEntry::new(
+                                        TimelineKind::Status,
+                                        if j.status == "Stopping…" {
+                                            "Stopped"
+                                        } else {
+                                            "Turn finished"
+                                        },
+                                        "",
+                                    ),
+                                    elapsed_ms,
+                                );
                                 done.push(id.clone());
                                 break;
                             }
                             ProviderEvent::Error(e) => {
+                                self.providers.get_mut(j.provider).fail(&e);
+                                push_timeline(
+                                    timeline,
+                                    TimelineEntry::new(TimelineKind::Error, "Provider error", &e),
+                                    elapsed_ms,
+                                );
                                 j.failed = true;
                                 self.notice = e.clone();
                                 if let Err(error) =
@@ -298,11 +449,11 @@ impl Engine {
         for id in done {
             if let Some(j) = self.jobs.remove(&id) {
                 let mut saved = true;
-                if !j.draft.text.is_empty() {
-                    if let Err(e) = self.store.save_message(&j.draft) {
-                        self.notice = format!("Could not save transcript: {e}");
-                        saved = false;
-                    }
+                if !j.draft.text.is_empty()
+                    && let Err(e) = self.store.save_message(&j.draft)
+                {
+                    self.notice = format!("Could not save transcript: {e}");
+                    saved = false;
                 }
                 if saved
                     && !j.failed
@@ -383,6 +534,13 @@ mod tests {
             .join("not-installed-test-provider")
             .to_string_lossy()
             .into_owned();
+        let state = e.providers.get_mut(Provider::Codex);
+        state.readiness = Readiness::Ready;
+        state.supported_access = vec![
+            AccessMode::Workspace,
+            AccessMode::ReadOnly,
+            AccessMode::Full,
+        ];
         (dir, e)
     }
     fn project_session(e: &mut Engine, path: &Path) -> String {
@@ -416,6 +574,53 @@ mod tests {
         assert_eq!(e.jobs.len(), 2);
         assert!(e.send(&b, "third".into()).unwrap_err().contains("slots"));
         assert_eq!(e.store.messages(&b).unwrap().len(), 0);
+    }
+    #[test]
+    fn unchecked_provider_cannot_send_or_persist_a_turn() {
+        let (dir, mut e) = fixture();
+        let id = project_session(&mut e, dir.path());
+        e.providers.get_mut(Provider::Codex).readiness = Readiness::Unchecked;
+        assert!(
+            e.send(&id, "blocked".into())
+                .unwrap_err()
+                .contains("Refresh")
+        );
+        assert!(e.jobs.is_empty());
+        assert!(e.store.messages(&id).unwrap().is_empty());
+    }
+    #[test]
+    fn general_chat_uses_neutral_app_directory_and_readonly_default() {
+        let (_dir, mut e) = fixture();
+        let id = e.new_general_chat().unwrap();
+        assert!(e.sessions[0].project_id.is_empty());
+        e.send(&id, "hello".into()).unwrap();
+        let run = e.jobs.get(&id).unwrap();
+        assert!(
+            run.canonical_path
+                .starts_with(e.lock_dir.join("general-chat"))
+        );
+        assert!(
+            !e.projects
+                .iter()
+                .any(|p| Path::new(&p.path) == run.canonical_path)
+        );
+        assert!(e.timelines[&id][0].detail.contains("Read-only"));
+    }
+    #[test]
+    fn effort_requires_current_models_advertised_capability() {
+        let (dir, mut e) = fixture();
+        let id = project_session(&mut e, dir.path());
+        assert!(
+            e.send_with_options(
+                &id,
+                "hello".into(),
+                Some("high".into()),
+                AccessMode::Workspace
+            )
+            .unwrap_err()
+            .contains("did not advertise")
+        );
+        assert!(e.jobs.is_empty());
     }
     #[test]
     fn approvals_are_deduplicated_and_bounded() {
@@ -507,6 +712,7 @@ mod tests {
         let a = project_session(&mut first, dir.path());
         let mut second = Engine::open_at(&dir.path().join("test.db")).unwrap();
         second.settings.codex_path = first.settings.codex_path.clone();
+        *second.providers.get_mut(Provider::Codex) = first.providers.get(Provider::Codex).clone();
         let b = project_session(&mut second, &dir.path().join("."));
         first.send(&a, "first window".into()).unwrap();
         assert!(
@@ -531,6 +737,7 @@ mod tests {
         let a = project_session(&mut first, dir.path());
         let mut second = Engine::open_at(&dir.path().join("test.db")).unwrap();
         second.settings.codex_path = first.settings.codex_path.clone();
+        *second.providers.get_mut(Provider::Codex) = first.providers.get(Provider::Codex).clone();
         let b = project_session(&mut second, dir.path());
         let db = rusqlite::Connection::open(dir.path().join("test.db")).unwrap();
         db.execute_batch("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL,'test failure'); END;").unwrap();

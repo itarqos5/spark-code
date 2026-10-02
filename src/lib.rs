@@ -6,3 +6,5 @@ pub mod store;
 pub mod engine;
 
 pub mod model_catalog;
+
+pub mod provider_status;

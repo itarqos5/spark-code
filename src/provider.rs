@@ -8,6 +8,7 @@
 //! The Claude wire format is implemented against the unmodified CLI, not the SDK.
 
 use crate::model::{Backup, MAX_MESSAGE_BYTES, Message, Project, Provider, Session};
+use crate::provider_status::{AccessMode, TimelineEntry, TimelineKind, UsageWindow};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -38,15 +39,19 @@ pub struct RunConfig {
     pub model: String,
     pub remote_id: Option<String>,
     pub prompt: String,
+    pub effort: Option<String>,
+    pub access: AccessMode,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProviderEvent {
     Started { remote_id: String },
     Text(String),
     Tool(String),
     Approval { id: String, description: String },
     Usage(String),
+    UsageSnapshot(Vec<UsageWindow>),
+    Timeline(TimelineEntry),
     Models(Vec<String>),
     Done,
     Error(String),
@@ -107,10 +112,10 @@ pub fn start(config: RunConfig) -> Result<Handle, String> {
                 Provider::Codex => run_codex(&config, &sink, &command_rx, &signal),
                 Provider::Claude => run_claude(&config, &sink, &command_rx, &signal),
             };
-            if let Err(error) = result {
-                if error != CANCELLED {
-                    let _ = sink.tx.try_send(ProviderEvent::Error(error));
-                }
+            if let Err(error) = result
+                && error != CANCELLED
+            {
+                let _ = sink.tx.try_send(ProviderEvent::Error(error));
             }
             let _ = sink.tx.try_send(ProviderEvent::Done);
             // run_* has returned, so every owned Transport/AuthChild has already
@@ -133,6 +138,20 @@ fn validate(config: &RunConfig) -> Result<(), String> {
     if config.cwd.is_empty() || config.cwd.contains('\0') {
         return Err("Choose a project folder".into());
     }
+    if config.provider == Provider::Codex && config.access == AccessMode::ChatOnly {
+        return Err("Codex tool-free mode is unavailable: this official protocol has no verified all-tools-off mode. Use Read-only general chat or select a project scope".into());
+    }
+    if config.provider == Provider::Claude && config.access == AccessMode::Full {
+        return Err("Claude full access bypasses its approval prompts and is not enabled in this client; choose project approval mode".into());
+    }
+    if config.effort.as_ref().is_some_and(|e| {
+        !matches!(
+            e.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    }) {
+        return Err("Unsupported reasoning effort".into());
+    }
     if config.prompt.trim().is_empty() {
         return Err("Enter a message first".into());
     }
@@ -143,7 +162,7 @@ fn validate(config: &RunConfig) -> Result<(), String> {
         || config
             .remote_id
             .as_ref()
-            .is_some_and(|s| s.len() > 256 || s.contains(['\0', '\n', '\r']))
+            .is_some_and(|s| s.len() > 256 || s.contains(['\0', '\n', '\r', '/', '\\']))
     {
         return Err("Invalid model or session identifier".into());
     }
@@ -179,7 +198,18 @@ impl EventSink {
         Ok(())
     }
     fn tool(&self, text: &str) -> Result<(), String> {
-        self.emit(ProviderEvent::Tool(redact(&truncate(text, MAX_EVENT))))
+        self.timeline(TimelineKind::Status, "Provider activity", text)
+    }
+    fn timeline(&self, kind: TimelineKind, label: &str, detail: &str) -> Result<(), String> {
+        self.emit(ProviderEvent::Timeline(TimelineEntry::new(
+            kind,
+            &redact(label),
+            &redact(detail),
+        )))
+    }
+    fn limits(&self, value: &Value) -> Result<(), String> {
+        self.emit(ProviderEvent::Usage(rate_usage(value)))?;
+        self.emit(ProviderEvent::UsageSnapshot(rate_windows(value)))
     }
 }
 
@@ -401,6 +431,13 @@ fn initialization() -> Value {
 fn codex_thread(config: &RunConfig) -> Value {
     // Enum spellings follow the generated protocol schema, not legacy docs examples.
     let mut params = json!({"cwd":config.cwd,"modelProvider":"openai","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":"workspace-write"});
+    params["sandbox"] = match config.access {
+        AccessMode::ReadOnly | AccessMode::ChatOnly => "read-only",
+        AccessMode::Workspace => "workspace-write",
+        AccessMode::Full => "danger-full-access",
+    }
+    .into();
+
     if !config.model.is_empty() {
         params["model"] = config.model.clone().into();
     }
@@ -418,6 +455,19 @@ fn codex_turn(config: &RunConfig, id: &str) -> Value {
     if !config.model.is_empty() {
         params["model"] = config.model.clone().into();
     }
+    match config.access {
+        AccessMode::ReadOnly | AccessMode::ChatOnly => {
+            params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
+        }
+        AccessMode::Full => {
+            params["sandboxPolicy"] = json!({"type":"dangerFullAccess"});
+        }
+        AccessMode::Workspace => {}
+    }
+    if let Some(effort) = &config.effort {
+        params["effort"] = effort.clone().into();
+    }
+    params["summary"] = "concise".into();
     rpc("turn/start", 5, params)
 }
 
@@ -552,6 +602,13 @@ fn run_codex(
                     _ => None,
                 };
                 if let Some(approval) = approval {
+                    if config.access == AccessMode::ChatOnly {
+                        transport.send(approval_response(approval, false))?;
+                        sink.tool(
+                            "Additional permissions denied by the selected read-only access mode",
+                        )?;
+                        continue;
+                    }
                     if p["threadId"].as_str() != Some(thread_id.as_str())
                         || (!turn_id.is_empty() && p["turnId"].as_str() != Some(turn_id.as_str()))
                         || pending.len() >= 32
@@ -613,10 +670,10 @@ fn run_codex(
                     }
                 }
                 "item/agentMessage/delta" if cancelling.is_none() => {
-                    if let Some(id) = p["itemId"].as_str() {
-                        if streamed.len() < 4096 {
-                            streamed.insert(id.to_owned());
-                        }
+                    if let Some(id) = p["itemId"].as_str()
+                        && streamed.len() < 4096
+                    {
+                        streamed.insert(id.to_owned());
                     }
                     if let Some(text) = p["delta"].as_str() {
                         sink.text(text)?;
@@ -626,33 +683,59 @@ fn run_codex(
                     let item = &p["item"];
                     let kind = item["type"].as_str().unwrap_or("");
                     if kind == "agentMessage" && method == "item/completed" {
-                        if !streamed.contains(item["id"].as_str().unwrap_or("")) {
-                            if let Some(text) = item["text"].as_str() {
-                                sink.text(text)?;
-                            }
+                        if !streamed.contains(item["id"].as_str().unwrap_or(""))
+                            && let Some(text) = item["text"].as_str()
+                        {
+                            sink.text(text)?;
                         }
-                    } else if !matches!(kind, "userMessage" | "agentMessage" | "reasoning") {
+                    } else if kind == "reasoning" && method == "item/completed" {
+                        if let Some(entry) = codex_summary(item) {
+                            sink.emit(ProviderEvent::Timeline(entry))?;
+                        }
+                    } else if matches!(
+                        kind,
+                        "commandExecution"
+                            | "fileChange"
+                            | "mcpToolCall"
+                            | "dynamicToolCall"
+                            | "functionCallOutput"
+                            | "plan"
+                            | "webSearch"
+                            | "imageView"
+                            | "imageGeneration"
+                            | "contextCompaction"
+                            | "enteredReviewMode"
+                            | "exitedReviewMode"
+                    ) {
                         let preview = display_json(item);
-                        if items.len() < 128 {
-                            if let Some(id) = item["id"].as_str() {
-                                items.insert(id.into(), truncate(&preview, MAX_EVENT));
-                            }
+                        if items.len() < 128
+                            && let Some(id) = item["id"].as_str()
+                        {
+                            items.insert(id.into(), truncate(&preview, MAX_EVENT));
                         }
-                        sink.tool(&format!("{method}: {preview}"))?;
+                        sink.timeline(
+                            if method == "item/started" {
+                                TimelineKind::ToolCall
+                            } else {
+                                TimelineKind::ToolResult
+                            },
+                            kind,
+                            &preview,
+                        )?;
                     }
                 }
                 "item/commandExecution/outputDelta" => {
                     if let Some(text) = p["delta"].as_str() {
-                        sink.tool(text)?;
+                        sink.timeline(TimelineKind::ToolResult, "Command output", text)?;
                     }
                 }
                 "turn/diff/updated" => {
                     if let Some(diff) = p["diff"].as_str() {
-                        sink.tool(&format!("Changes:\n{diff}"))?;
+                        sink.timeline(TimelineKind::ToolResult, "File changes", diff)?;
                     }
                 }
                 "thread/tokenUsage/updated" => sink.emit(ProviderEvent::Usage(token_usage(p)))?,
-                "account/rateLimits/updated" => sink.emit(ProviderEvent::Usage(rate_usage(p)))?,
+                "account/rateLimits/updated" => sink.limits(p)?,
                 "serverRequest/resolved" => {
                     pending.remove(&format!("codex:{}", p["requestId"]));
                 }
@@ -708,7 +791,7 @@ fn run_codex(
                     .unwrap_or("connected");
                 sink.emit(ProviderEvent::Usage(format!(
                     "ChatGPT subscription: {}",
-                    redact(plan)
+                    redact(&truncate(plan, 128))
                 )))?;
                 transport.send(rpc("model/list", 2, json!({"limit":100})))?;
                 transport.send(rpc("account/rateLimits/read", 3, json!({})))?;
@@ -716,7 +799,7 @@ fn run_codex(
                 phase_start = Instant::now();
             }
             2 => sink.emit(ProviderEvent::Models(model_names(result)))?,
-            3 => sink.emit(ProviderEvent::Usage(rate_usage(result)))?,
+            3 => sink.limits(result)?,
             4 => {
                 thread_id = result["thread"]["id"]
                     .as_str()
@@ -757,6 +840,64 @@ fn claude_args(config: &RunConfig) -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect::<Vec<_>>();
+    let mode = match config.access {
+        AccessMode::Full => "default",
+        AccessMode::ReadOnly => "plan",
+        AccessMode::ChatOnly => "dontAsk",
+        AccessMode::Workspace => "default",
+    };
+    if let Some(pos) = args.iter().position(|a| a == "--permission-mode") {
+        args[pos + 1] = mode.into();
+    }
+    // Subscription-preserving safe mode suppresses local customizations. Managed
+    // administrator hooks/policy still apply: this is a model-tool boundary, not
+    // an OS sandbox. `--bare` would remove subscription authentication.
+    if matches!(config.access, AccessMode::ChatOnly | AccessMode::ReadOnly) {
+        args.extend(
+            [
+                "--safe-mode",
+                "--setting-sources",
+                "",
+                "--settings",
+                "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}",
+                "--disable-slash-commands",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if config.access == AccessMode::ChatOnly {
+        args.extend(
+            [
+                "--tools",
+                "",
+                "--disallowedTools",
+                "*",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    } else if config.access == AccessMode::ReadOnly {
+        args.extend(
+            [
+                "--tools",
+                "Read,Glob,Grep",
+                "--disallowedTools",
+                "mcp__*",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if let Some(effort) = &config.effort {
+        args.push(format!("--effort={effort}"));
+    }
     // Equals form prevents a dash-leading model/session value becoming a new flag.
     if !config.model.is_empty() {
         args.push(format!("--model={}", config.model));
@@ -894,13 +1035,15 @@ fn run_claude(
             Err(_) if cancelling.is_some() => return Err(CANCELLED.into()),
             Err(e) => return Err(e),
         };
-        if !seen_session {
-            if let Some(id) = value["session_id"].as_str().filter(|id| !id.is_empty()) {
-                sink.emit(ProviderEvent::Started {
-                    remote_id: id.into(),
-                })?;
-                seen_session = true;
-            }
+        if !seen_session
+            && let Some(id) = value["session_id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+        {
+            sink.emit(ProviderEvent::Started {
+                remote_id: id.into(),
+            })?;
+            seen_session = true;
         }
         match value["type"].as_str().unwrap_or("") {
             "control_response" if value["response"]["request_id"] == "spark-init" => {
@@ -916,6 +1059,7 @@ fn run_claude(
                                     v["value"]
                                         .as_str()
                                         .or_else(|| v["id"].as_str())
+                                        .filter(|s| s.len() <= 256)
                                         .map(str::to_owned)
                                 })
                                 .take(100)
@@ -944,7 +1088,10 @@ fn run_claude(
                         request["tool_name"].as_str().unwrap_or("Tool action"),
                         display_json(request)
                     );
-                    if cancelling.is_some() || pending.len() >= 32 || description.len() > MAX_EVENT
+                    if config.access == AccessMode::ChatOnly
+                        || cancelling.is_some()
+                        || pending.len() >= 32
+                        || description.len() > MAX_EVENT
                     {
                         transport.send(approval_response(approval, false))?;
                         sink.tool("Tool approval denied because the request was cancelled, oversized, or exceeded the pending limit")?;
@@ -970,12 +1117,12 @@ fn run_claude(
                 if event["type"] == "message_start" {
                     streamed_message = false;
                 }
-                if event["delta"]["type"] == "text_delta" {
-                    if let Some(text) = event["delta"]["text"].as_str() {
-                        sink.text(text)?;
-                        streamed_message = true;
-                        got_text = true;
-                    }
+                if event["delta"]["type"] == "text_delta"
+                    && let Some(text) = event["delta"]["text"].as_str()
+                {
+                    sink.text(text)?;
+                    streamed_message = true;
+                    got_text = true;
                 }
             }
             "assistant" => {
@@ -990,11 +1137,11 @@ fn run_claude(
                                     got_text = true;
                                 }
                             }
-                            Some("tool_use") => sink.tool(&format!(
-                                "{}: {}",
+                            Some("tool_use") => sink.timeline(
+                                TimelineKind::ToolCall,
                                 part["name"].as_str().unwrap_or("Tool"),
-                                display_json(&part["input"])
-                            ))?,
+                                &display_json(&part["input"]),
+                            )?,
                             _ => {}
                         }
                     }
@@ -1003,16 +1150,23 @@ fn run_claude(
                     sink.emit(ProviderEvent::Error(safe_error(error)))?;
                 }
             }
+            "user" => {
+                if let Some(parts) = value["message"]["content"].as_array() {
+                    for part in parts {
+                        if let Some(entry) = claude_tool_result(part) {
+                            sink.emit(ProviderEvent::Timeline(entry))?;
+                        }
+                    }
+                }
+            }
             "system" if value["subtype"] == "permission_denied" => {
                 sink.tool("Claude denied an action under its permission policy")?
             }
             "result" => {
                 if value["is_error"] == true {
                     sink.emit(ProviderEvent::Error(safe_error(&value)))?;
-                } else if !got_text {
-                    if let Some(text) = value["result"].as_str() {
-                        sink.text(text)?;
-                    }
+                } else if !got_text && let Some(text) = value["result"].as_str() {
+                    sink.text(text)?;
                 }
                 sink.emit(ProviderEvent::Usage(claude_usage(&value)))?;
                 if value["permission_denials"]
@@ -1030,6 +1184,99 @@ fn run_claude(
     }
 }
 
+// Only the documented, provider-exposed summary is visible. `content` and
+// reasoning/textDelta (raw reasoning), Claude thinking and signature fields are ignored.
+fn codex_summary(item: &Value) -> Option<TimelineEntry> {
+    if item["type"] != "reasoning" {
+        return None;
+    }
+    let summary = item["summary"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .take(16)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if summary.is_empty() {
+        None
+    } else {
+        Some(TimelineEntry::new(
+            TimelineKind::Summary,
+            "Provider reasoning summary",
+            &redact(&truncate(&summary, 2048)),
+        ))
+    }
+}
+fn claude_tool_result(part: &Value) -> Option<TimelineEntry> {
+    if part["type"] != "tool_result" {
+        return None;
+    }
+    let label = if part["is_error"] == true {
+        "Tool failed"
+    } else {
+        "Tool result"
+    };
+    Some(TimelineEntry::new(
+        TimelineKind::ToolResult,
+        label,
+        &display_json(&part["content"]),
+    ))
+}
+fn rate_windows(v: &Value) -> Vec<UsageWindow> {
+    let limits = &v["rateLimits"];
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|name| {
+            let w = &limits[name];
+            let percent = w["usedPercent"].as_f64()?;
+            if !percent.is_finite() || percent < 0. {
+                return None;
+            }
+            let label = match w["windowDurationMins"].as_u64() {
+                Some(300) => "5-hour window".into(),
+                Some(10080) => "Weekly window".into(),
+                Some(m) if m % 60 == 0 => format!("{}-hour window", m / 60),
+                Some(m) => format!("{m}-minute window"),
+                None => format!("{name} window"),
+            };
+            Some(UsageWindow {
+                label,
+                used_percent: percent.min(100.) as f32,
+                resets_at: w["resetsAt"].as_i64(),
+            })
+        })
+        .collect()
+}
+fn codex_efforts(v: &Value) -> Vec<(String, Vec<String>)> {
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["hidden"] != true)
+        .take(100)
+        .filter_map(|m| {
+            let name = m["model"].as_str().or_else(|| m["id"].as_str())?;
+            if name.len() > 256 {
+                return None;
+            }
+            let efforts = m["supportedReasoningEfforts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e["reasoningEffort"].as_str())
+                .filter(|e| {
+                    matches!(
+                        *e,
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                    )
+                })
+                .take(8)
+                .map(str::to_owned)
+                .collect();
+            Some((name.into(), efforts))
+        })
+        .collect()
+}
 fn token_usage(v: &Value) -> String {
     let usage = &v["tokenUsage"]["total"];
     format!(
@@ -1325,6 +1572,11 @@ pub struct ProviderInfo {
     pub models: Vec<String>,
     pub usage: String,
     pub status: String,
+    pub usage_windows: Vec<UsageWindow>,
+    pub supported_efforts: Vec<String>,
+    pub model_efforts: Vec<(String, Vec<String>)>,
+    pub supported_access: Vec<AccessMode>,
+    pub tool_free_supported: bool,
 }
 
 /// Explicit account/model refresh. This is blocking: call it from a UI worker.
@@ -1350,22 +1602,42 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
             let plan = account["account"]["planType"]
                 .as_str()
                 .unwrap_or("connected");
-            let status = format!("ChatGPT subscription connected ({})", redact(plan));
+            let status = format!(
+                "ChatGPT subscription connected ({})",
+                redact(&truncate(plan, 128))
+            );
             transport.send(rpc("model/list", 2, json!({"limit":100})))?;
-            let models = import_response(&transport, 2)
-                .map(|v| model_names(&v))
-                .unwrap_or_default();
+            let catalog = import_response(&transport, 2)?;
+            let models = model_names(&catalog);
+            let model_efforts = codex_efforts(&catalog);
+            let mut supported_efforts = Vec::new();
+            for (_, efforts) in &model_efforts {
+                for effort in efforts {
+                    if !supported_efforts.contains(effort) {
+                        supported_efforts.push(effort.clone());
+                    }
+                }
+            }
             transport.send(rpc("account/rateLimits/read", 3, json!({})))?;
-            let usage = import_response(&transport, 3)
-                .map(|v| rate_usage(&v))
-                .unwrap_or_else(|_| {
-                    "Subscription limits are unavailable from this CLI/account".into()
-                });
+            let limits = import_response(&transport, 3);
+            let usage_windows = limits.as_ref().map(rate_windows).unwrap_or_default();
+            let usage = limits.map(|v| rate_usage(&v)).unwrap_or_else(|_| {
+                "Subscription limits are unavailable from this CLI/account".into()
+            });
             transport.close();
             Ok(ProviderInfo {
                 models,
                 usage,
                 status,
+                usage_windows,
+                supported_efforts,
+                model_efforts,
+                supported_access: vec![
+                    AccessMode::ReadOnly,
+                    AccessMode::Workspace,
+                    AccessMode::Full,
+                ],
+                tool_free_supported: false,
             })
         }
         Provider::Claude => {
@@ -1376,6 +1648,8 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
                 model: String::new(),
                 remote_id: None,
                 prompt: String::new(),
+                effort: None,
+                access: AccessMode::ChatOnly,
             };
             let (_sender, receiver) = mpsc::sync_channel(1);
             claude_auth(&config, &AtomicBool::new(false), &receiver)?;
@@ -1387,6 +1661,7 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
             ))?;
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut models = Vec::new();
+            let mut handshake_ok = false;
             while Instant::now() < deadline {
                 let value = match transport.next() {
                     Ok(Some(v)) => v,
@@ -1397,6 +1672,7 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
                     && value["response"]["request_id"] == "spark-probe"
                 {
                     if value["response"]["subtype"] == "success" {
+                        handshake_ok = true;
                         models = value["response"]["response"]["models"]
                             .as_array()
                             .map(|a| {
@@ -1419,10 +1695,18 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
                 }
             }
             transport.close();
+            if !handshake_ok {
+                return Err("Claude CLI could not verify the required safe stream protocol. Update the official CLI and refresh".into());
+            }
             Ok(ProviderInfo {
                 models,
-                usage: "Claude CLI does not expose subscription quota percentages here".into(),
+                usage: "Subscription quota and reset unavailable from the official Claude CLI stream; token counts are not quota percentages".into(),
                 status: "Claude subscription connected".into(),
+                usage_windows:vec![],
+                supported_efforts:vec![],
+                model_efforts:vec![],
+                supported_access:vec![AccessMode::ChatOnly,AccessMode::ReadOnly,AccessMode::Workspace],
+                tool_free_supported:true,
             })
         }
     }
@@ -1494,6 +1778,8 @@ mod tests {
             model: String::new(),
             remote_id: None,
             prompt: "Hello; $(no shell)\nnext".into(),
+            effort: None,
+            access: AccessMode::Workspace,
         }
     }
     #[test]
@@ -1582,6 +1868,83 @@ mod tests {
         assert!(truncate(&s, 100).len() <= 100);
     }
     #[test]
+    fn usage_windows_use_only_official_numbers_and_resets() {
+        let windows = rate_windows(
+            &json!({"rateLimits":{"primary":{"usedPercent":25.5,"resetsAt":1780000000,"windowDurationMins":300},"secondary":{"usedPercent":80,"windowDurationMins":10080}}}),
+        );
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].used_percent, 25.5);
+        assert_eq!(windows[0].resets_at, Some(1780000000));
+        assert_eq!(windows[0].label, "5-hour window");
+        assert_eq!(windows[1].label, "Weekly window");
+        assert!(windows[1].resets_at.is_none());
+        assert!(rate_windows(&json!({"usage":{"input_tokens":1000}})).is_empty());
+        assert!(rate_windows(&json!({"rateLimits":{"primary":{"usedPercent":-1}}})).is_empty());
+    }
+    #[test]
+    fn reasoning_summary_never_displays_raw_content() {
+        let e=codex_summary(&json!({"type":"reasoning","summary":["Brief provider summary"],"content":["PRIVATE RAW REASONING"]})).unwrap();
+        assert_eq!(e.kind, TimelineKind::Summary);
+        assert_eq!(e.detail, "Brief provider summary");
+        assert!(!e.detail.contains("PRIVATE"));
+        assert!(codex_summary(&json!({"type":"reasoning","content":["PRIVATE"]})).is_none());
+        assert!(claude_tool_result(&json!({"type":"thinking","thinking":"PRIVATE"})).is_none());
+        assert!(
+            claude_tool_result(&json!({"type":"signature_delta","signature":"PRIVATE"})).is_none()
+        );
+    }
+    #[test]
+    fn claude_tool_result_preserves_actual_result_and_redacts_keys() {
+        let e=claude_tool_result(&json!({"type":"tool_result","content":{"stdout":"tests passed","api_key":"sk-private"},"is_error":false})).unwrap();
+        assert_eq!(e.kind, TimelineKind::ToolResult);
+        assert!(e.detail.contains("tests passed"));
+        assert!(!e.detail.contains("sk-private"));
+    }
+    #[test]
+    fn codex_effort_is_model_specific_and_protocol_checked() {
+        let efforts = codex_efforts(
+            &json!({"data":[{"model":"small","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"fictional"}]},{"model":"hidden","hidden":true,"supportedReasoningEfforts":[{"reasoningEffort":"max"}]}]}),
+        );
+        assert_eq!(
+            efforts,
+            vec![("small".into(), vec!["low".into(), "high".into()])]
+        );
+        let mut c = config(Provider::Codex);
+        c.effort = Some("high".into());
+        c.access = AccessMode::ReadOnly;
+        let wire = codex_turn(&c, "thread");
+        assert_eq!(wire["params"]["effort"], "high");
+        assert_eq!(
+            wire["params"]["sandboxPolicy"],
+            json!({"type":"readOnly","networkAccess":false})
+        );
+        assert_eq!(wire["params"]["approvalPolicy"], "untrusted");
+    }
+    #[test]
+    fn claude_chat_only_disables_builtins_mcp_and_customizations_without_bare() {
+        let mut c = config(Provider::Claude);
+        c.access = AccessMode::ChatOnly;
+        let args = claude_args(&c);
+        for (flag, value) in [
+            ("--tools", ""),
+            ("--disallowedTools", "*"),
+            ("--mcp-config", "{\"mcpServers\":{}}"),
+            ("--permission-mode", "dontAsk"),
+            ("--setting-sources", ""),
+        ] {
+            let i = args.iter().position(|a| a == flag).unwrap();
+            assert_eq!(args[i + 1], value);
+        }
+        assert!(args.contains(&"--safe-mode".to_string()));
+        assert!(!args.contains(&"--bare".to_string()));
+        assert!(!args.contains(&c.prompt));
+        c.provider = Provider::Codex;
+        assert!(validate(&c).unwrap_err().contains("no verified"));
+        c.provider = Provider::Claude;
+        c.remote_id = Some("/private/history.jsonl".into());
+        assert!(validate(&c).is_err());
+    }
+    #[test]
     fn models_and_usage_are_real_protocol_fields() {
         assert_eq!(
             model_names(
@@ -1635,6 +1998,8 @@ for line in sys.stdin:
         event('turn/started',{'threadId':'thread-mock','turn':{'id':'turn-mock'}})
         event('item/agentMessage/delta',{'threadId':'thread-mock','itemId':'msg','delta':'Hello from mock'})
         if MODE not in ('cancel', 'cancel-stuck'):
+            event('item/started',{'threadId':'thread-mock','item':{'type':'commandExecution','id':'cmd','command':'echo mock'}})
+            event('item/completed',{'threadId':'thread-mock','item':{'type':'reasoning','id':'reason','summary':['Provider brief summary'],'content':['PRIVATE RAW REASONING']}})
             event('item/commandExecution/requestApproval',{'threadId':'thread-mock','turnId':'turn-mock','itemId':'cmd','command':'echo mock'}) if False else None
             out({'id':47,'method':'item/commandExecution/requestApproval','params':{'threadId':'thread-mock','turnId':'turn-mock','itemId':'cmd','command':'echo mock'}})
     elif method == 'turn/interrupt':
@@ -1645,6 +2010,7 @@ for line in sys.stdin:
     elif v.get('id') == 47:
         open('decision','w').write(v['result']['decision'])
         event('item/completed',{'threadId':'thread-mock','item':{'id':'msg','type':'agentMessage','text':'Hello from mock'}})
+        event('item/completed',{'threadId':'thread-mock','item':{'type':'commandExecution','id':'cmd','command':'echo mock','aggregatedOutput':'actual tool output','exitCode':0}})
         event('turn/completed',{'threadId':'thread-mock','turn':{'id':'turn-mock','status':'completed'}})
     elif method == 'thread/list': response(v['id'],{'data':[{'id':'historic'}],'nextCursor':None})
     elif method == 'thread/read': response(v['id'],{'thread':{'id':'historic','name':'Saved test','turns':[{'items':[{'type':'userMessage','content':[{'type':'text','text':'Question'}]},{'type':'agentMessage','text':'Answer'}]}]}})
@@ -1656,7 +2022,8 @@ for line in sys.stdin:
         out({'type':'system','subtype':'init','session_id':'claude-mock'})
         out({'type':'stream_event','parent_tool_use_id':None,'event':{'type':'message_start'}})
         out({'type':'stream_event','parent_tool_use_id':None,'event':{'delta':{'type':'text_delta','text':'Hello Claude'}}})
-        out({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'Hello Claude'}]}})
+        out({'type':'assistant','parent_tool_use_id':None,'message':{'content':[{'type':'text','text':'Hello Claude'},{'type':'tool_use','id':'tool-1','name':'Bash','input':{'command':'echo mock'}},{'type':'thinking','thinking':'PRIVATE RAW REASONING'}]}})
+        out({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool-1','content':'actual tool output'}]}})
         out({'type':'control_request','request_id':'permission-1','request':{'subtype':'can_use_tool','tool_name':'Bash','input':{'command':'echo test'}}})
     elif v.get('type')=='control_response':
         open('decision','w').write(v['response']['response']['behavior'])
@@ -1699,6 +2066,37 @@ for line in sys.stdin:
             }
         }
         events
+    }
+    #[cfg(unix)]
+    #[test]
+    fn actual_streams_produce_structured_timeline_without_hidden_reasoning() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        for provider in Provider::ALL {
+            let (dir, exe) = mock_cli("normal");
+            let handle = start(mock_config(provider, &dir, exe)).unwrap();
+            let events = until_done(&handle, true);
+            assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+            assert!(events.iter().any(|e|matches!(e,ProviderEvent::Timeline(t) if t.kind==TimelineKind::ToolCall && t.detail.contains("echo mock"))));
+            assert!(events.iter().any(|e|matches!(e,ProviderEvent::Timeline(t) if t.kind==TimelineKind::ToolResult && t.detail.contains("actual tool output"))));
+            assert!(!format!("{events:?}").contains("PRIVATE RAW REASONING"));
+            if provider == Provider::Codex {
+                assert!(events.iter().any(|e|matches!(e,ProviderEvent::Timeline(t) if t.kind==TimelineKind::Summary && t.detail=="Provider brief summary")));
+                assert!(events.iter().any(|e|matches!(e,ProviderEvent::UsageSnapshot(w) if w.len()==1 && w[0].used_percent==12.)));
+            }
+        }
+    }
+    #[test]
+    fn expanded_codex_filesystem_scope_keeps_user_approvals() {
+        let mut c = config(Provider::Codex);
+        c.access = AccessMode::Full;
+        let thread = codex_thread(&c);
+        let turn = codex_turn(&c, "thread");
+        assert_eq!(thread["params"]["sandbox"], "danger-full-access");
+        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert_eq!(turn["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(turn["params"]["approvalsReviewer"], "user");
+        c.provider = Provider::Claude;
+        assert!(validate(&c).is_err());
     }
     #[cfg(unix)]
     #[test]

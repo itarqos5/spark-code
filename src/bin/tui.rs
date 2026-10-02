@@ -121,10 +121,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 app.probe_receiver = None;
                 match result {
                     Ok(info) => {
-                        app.engine.models.set(source_provider, info.models);
                         app.notice = format!("{} · {}", info.status, info.usage);
+                        app.engine.probe_succeeded(source_provider, info);
                     }
-                    Err(e) => app.notice = e,
+                    Err(e) => {
+                        app.engine.provider_failed(source_provider, &e);
+                        app.notice = e;
+                    }
                 }
             }
         }

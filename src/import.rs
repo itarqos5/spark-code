@@ -103,7 +103,7 @@ pub(crate) fn validate(b: &Backup) -> Result<(), String> {
         if s.id.is_empty() || !sessions.insert(s.id.as_str()) {
             return Err("Backup has empty or duplicate conversation IDs".into());
         }
-        if !projects.contains(s.project_id.as_str()) {
+        if !s.project_id.is_empty() && !projects.contains(s.project_id.as_str()) {
             return Err("Backup contains an orphaned conversation".into());
         }
         for field in [&s.id, &s.project_id, &s.title, &s.model] {

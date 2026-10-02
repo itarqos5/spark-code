@@ -87,7 +87,10 @@ impl Message {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
+    pub light_theme: bool,
+    pub reduced_motion: bool,
     pub codex_path: String,
     pub claude_path: String,
     pub provider: Provider,
@@ -96,6 +99,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            light_theme: false,
+            reduced_motion: false,
             codex_path: "codex".into(),
             claude_path: "claude".into(),
             provider: Provider::Codex,
@@ -110,4 +115,28 @@ pub struct Backup {
     pub projects: Vec<Project>,
     pub sessions: Vec<Session>,
     pub messages: Vec<Message>,
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+    #[test]
+    fn old_settings_keep_provider_paths_when_appearance_fields_are_added() {
+        let settings: Settings = serde_json::from_str(r#"{"codex_path":"C:/tools/codex.exe","claude_path":"C:/tools/claude.exe","provider":"Claude","model":"custom-model"}"#).unwrap();
+        assert_eq!(settings.codex_path, "C:/tools/codex.exe");
+        assert_eq!(settings.provider, Provider::Claude);
+        assert!(!settings.light_theme);
+        assert!(!settings.reduced_motion);
+    }
+    #[test]
+    fn appearance_preferences_round_trip() {
+        let settings = Settings {
+            light_theme: true,
+            reduced_motion: true,
+            ..Settings::default()
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.light_theme && restored.reduced_motion);
+    }
 }

@@ -1,32 +1,62 @@
+use crate::appearance::Colors;
 use iced::{
     Color, Element, Length, Subscription, Task, Theme,
-    widget::{
-        Space, button, checkbox, column, container, pick_list, row, scrollable, text, text_editor,
-        text_input,
-    },
+    widget::{Space, container, markdown, text_editor},
 };
-use spark_code::{engine::Engine, import, model::*, provider};
-use std::{collections::HashSet, sync::mpsc, time::Duration};
+use spark_code::{
+    engine::Engine,
+    import,
+    model::*,
+    provider,
+    provider_status::{AccessMode, Readiness},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+#[path = "ui.rs"]
+mod ui;
 
 pub fn run() -> iced::Result {
+    set_app_id();
     iced::application(App::new, App::update, App::view)
-        .title("spark-code")
-        .theme(|_: &App| {
-            Theme::custom(
-                "spark dark",
-                iced::theme::Palette {
-                    background: Color::from_rgb8(14, 18, 25),
-                    text: Color::from_rgb8(231, 237, 245),
-                    primary: Color::from_rgb8(254, 136, 96),
-                    success: Color::from_rgb8(86, 203, 177),
-                    warning: Color::from_rgb8(241, 195, 92),
-                    danger: Color::from_rgb8(247, 100, 120),
-                },
-            )
-        })
+        .title("Spark Code")
+        .font(include_bytes!("../assets/fonts/InterVariable.ttf").as_slice())
+        .default_font(iced::Font::with_name("Inter Variable"))
+        .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((1180., 780.))
+        .window(iced::window::Settings {
+            size: iced::Size::new(1280., 840.),
+            min_size: Some(iced::Size::new(920., 640.)),
+            decorations: false,
+            icon: load_icon(),
+            ..Default::default()
+        })
         .run()
+}
+fn load_icon() -> Option<iced::window::Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!(
+        "../assets/branding/spark-code.png"
+    )));
+    let mut reader = decoder.read_info().ok()?;
+    let mut bytes = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut bytes).ok()?;
+    bytes.truncate(info.buffer_size());
+    iced::window::icon::from_rgba(bytes, info.width, info.height).ok()
+}
+fn set_app_id() {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SetCurrentProcessExplicitAppUserModelID(id: *const u16) -> i32;
+        }
+        let id: Vec<u16> = "SparkCode.Desktop".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let _ = SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+        }
+    }
 }
 struct App {
     engine: Result<Engine, String>,
@@ -44,10 +74,47 @@ struct App {
     receiver: Option<mpsc::Receiver<Result<Backup, String>>>,
     notice: String,
     model: String,
+    current_provider: Provider,
+    effort: String,
+    access: String,
+    full_access_confirmation: bool,
+    ime_composing: bool,
+    last_ime_event: Option<Instant>,
+    show_agents: bool,
+    sidebar_visible: bool,
+    rendered: HashMap<String, (usize, markdown::Content)>,
+    theme_mix: f32,
+    theme_from: f32,
+    theme_target: f32,
+    theme_started: Option<Instant>,
+    motion_started: Option<Instant>,
+    capture_started: Option<Instant>,
+    capture_path: Option<String>,
 }
 #[derive(Debug, Clone)]
 enum Msg {
     Tick,
+    GeneralChat,
+    ComposerSubmit,
+    ImeUpdate(bool),
+    ImeCommit,
+    Effort(String),
+    AccessRequested(String),
+    ConfirmFullAccess,
+    CancelFullAccess,
+    Resize(iced::window::Direction),
+    SystemMenu,
+    RequestCapture,
+    DragWindow,
+    Minimize,
+    Maximize,
+    CloseWindow,
+    ToggleTheme,
+    ReducedMotion(bool),
+    ToggleAgents,
+    ToggleSidebar,
+    OpenLink(String),
+    Capture(iced::window::Screenshot),
     Edit(text_editor::Action),
     Probe(Provider),
     Login(Provider),
@@ -79,15 +146,43 @@ enum Msg {
 impl App {
     fn new() -> Self {
         let engine = Engine::open();
-        let project = engine
-            .as_ref()
-            .ok()
-            .and_then(|e| e.projects.first().map(|p| p.id.clone()));
+        let project: Option<String> = None;
         let model = engine
             .as_ref()
             .map(|e| e.settings.model.clone())
             .unwrap_or_default();
+        let current_provider = engine
+            .as_ref()
+            .map(|e| e.settings.provider)
+            .unwrap_or_default();
+        let theme_mix = if engine.as_ref().is_ok_and(|e| e.settings.light_theme) {
+            1.
+        } else {
+            0.
+        };
+        let capture_path = std::env::var("SPARK_CODE_CAPTURE").ok();
         Self {
+            current_provider,
+            effort: String::new(),
+            access: if project.is_some() {
+                AccessMode::Workspace
+            } else {
+                AccessMode::ReadOnly
+            }
+            .to_string(),
+            full_access_confirmation: false,
+            ime_composing: false,
+            last_ime_event: None,
+            show_agents: false,
+            sidebar_visible: true,
+            rendered: HashMap::new(),
+            theme_mix,
+            theme_from: theme_mix,
+            theme_target: theme_mix,
+            theme_started: None,
+            motion_started: None,
+            capture_started: capture_path.as_ref().map(|_| Instant::now()),
+            capture_path,
             engine,
             selected: None,
             project,
@@ -109,27 +204,66 @@ impl App {
         let timer = if self.engine.as_ref().is_ok_and(|e| !e.jobs.is_empty())
             || self.receiver.is_some()
             || self.probe_receiver.is_some()
+            || self.theme_started.is_some()
+            || self.motion_started.is_some()
+            || self.capture_started.is_some()
         {
-            iced::time::every(Duration::from_millis(80)).map(|_| Msg::Tick)
+            iced::time::every(Duration::from_millis(
+                if self.theme_started.is_some() || self.motion_started.is_some() {
+                    16
+                } else {
+                    80
+                },
+            ))
+            .map(|_| Msg::Tick)
         } else {
             Subscription::none()
         };
         Subscription::batch([
             timer,
-            iced::event::listen_with(|event, _status, _window| {
-                let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key, modifiers, ..
-                }) = event
-                else {
-                    return None;
-                };
-                if modifiers.control()
-                    && key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-                {
-                    Some(Msg::Send)
-                } else {
-                    None
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::InputMethod(iced::advanced::input_method::Event::Preedit(
+                    value,
+                    _,
+                )) => Some(Msg::ImeUpdate(!value.is_empty())),
+                iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_)) => {
+                    Some(Msg::ImeCommit)
                 }
+                iced::Event::InputMethod(iced::advanced::input_method::Event::Closed) => {
+                    Some(Msg::ImeUpdate(false))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => {
+                    if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                        Some(Msg::CancelFullAccess)
+                    } else if modifiers.alt()
+                        && key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Space)
+                    {
+                        Some(Msg::SystemMenu)
+                    } else if modifiers.control()
+                        && key == iced::keyboard::Key::Character("n".into())
+                    {
+                        Some(Msg::New)
+                    } else if modifiers.control()
+                        && key == iced::keyboard::Key::Character(",".into())
+                    {
+                        Some(Msg::Settings)
+                    } else if modifiers.control()
+                        && modifiers.shift()
+                        && matches!(key.as_ref(), iced::keyboard::Key::Character("t" | "T"))
+                    {
+                        Some(Msg::ToggleTheme)
+                    } else if modifiers.control()
+                        && modifiers.shift()
+                        && matches!(key.as_ref(), iced::keyboard::Key::Character("s" | "S"))
+                    {
+                        Some(Msg::RequestCapture)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }),
         ])
     }
@@ -137,14 +271,98 @@ impl App {
         if let (Ok(e), Some(id)) = (&self.engine, &self.selected) {
             self.messages = e.store.messages(id).unwrap_or_default();
             if let Some(s) = e.sessions.iter().find(|s| &s.id == id) {
-                self.project = Some(s.project_id.clone());
+                self.project = (!s.project_id.is_empty()).then(|| s.project_id.clone());
+                self.current_provider = s.provider;
                 self.model = s.model.clone();
             }
         }
     }
-    fn update(&mut self, msg: Msg) -> Task<Msg> {
-        if let Msg::Copy(s) = msg {
-            return iced::clipboard::write(s);
+    fn update(&mut self, mut msg: Msg) -> Task<Msg> {
+        if matches!(msg, Msg::ComposerSubmit) {
+            if submission_blocked_by_ime(
+                self.ime_composing,
+                self.last_ime_event.map(|at| at.elapsed()),
+            ) {
+                return Task::none();
+            }
+            msg = Msg::Send;
+        }
+        if self.full_access_confirmation
+            && !matches!(
+                msg,
+                Msg::ConfirmFullAccess
+                    | Msg::CancelFullAccess
+                    | Msg::Tick
+                    | Msg::Capture(_)
+                    | Msg::RequestCapture
+                    | Msg::CloseWindow
+                    | Msg::ImeUpdate(_)
+                    | Msg::ImeCommit
+            )
+        {
+            return Task::none();
+        }
+        if matches!(msg, Msg::Send) && !self.can_send() {
+            self.notice = self.send_hint();
+            return Task::none();
+        }
+        match &msg {
+            Msg::Copy(s) => return iced::clipboard::write(s.clone()),
+            Msg::Resize(direction) => {
+                let direction = *direction;
+                return iced::window::latest()
+                    .and_then(move |id| iced::window::drag_resize(id, direction));
+            }
+            Msg::SystemMenu => {
+                crate::window_chrome::show_system_menu();
+                return Task::none();
+            }
+            Msg::RequestCapture => {
+                return iced::window::latest()
+                    .and_then(iced::window::screenshot)
+                    .map(Msg::Capture);
+            }
+            Msg::DragWindow => return iced::window::latest().and_then(iced::window::drag),
+            Msg::Minimize => {
+                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+            }
+            Msg::Maximize => return iced::window::latest().and_then(iced::window::toggle_maximize),
+            Msg::CloseWindow => return iced::window::latest().and_then(iced::window::close),
+            Msg::Capture(shot) => {
+                if let Some(path) = &self.capture_path {
+                    if let Err(err) = save_capture(
+                        &capture_destination(
+                            path,
+                            self.engine.as_ref().is_ok_and(|e| e.settings.light_theme),
+                            self.settings,
+                            !self.messages.is_empty(),
+                        ),
+                        shot,
+                    ) {
+                        self.notice = format!("Preview capture failed: {err}");
+                    }
+                }
+                return Task::none();
+            }
+            Msg::Tick
+                if self
+                    .capture_started
+                    .is_some_and(|t| t.elapsed() > Duration::from_millis(900)) =>
+            {
+                self.capture_started = None;
+                return iced::window::latest()
+                    .and_then(iced::window::screenshot)
+                    .map(Msg::Capture);
+            }
+            _ => {}
+        }
+        if matches!(msg, Msg::Settings | Msg::Select(_) | Msg::New)
+            && self
+                .engine
+                .as_ref()
+                .is_ok_and(|e| !e.settings.reduced_motion)
+        {
+            self.motion_started = Some(Instant::now());
         }
         let Ok(e) = &mut self.engine else {
             return Task::none();
@@ -152,15 +370,43 @@ impl App {
         let result: Result<(), String> = (|| {
             match msg {
                 Msg::Tick => {
+                    if let Some(start) = self.theme_started {
+                        let t = (start.elapsed().as_secs_f32() / 0.2).min(1.);
+                        let eased = t * t * (3. - 2. * t);
+                        self.theme_mix =
+                            self.theme_from + (self.theme_target - self.theme_from) * eased;
+                        if t >= 1. {
+                            self.theme_started = None;
+                        }
+                    }
+                    if self
+                        .motion_started
+                        .is_some_and(|t| t.elapsed() > Duration::from_millis(180))
+                    {
+                        self.motion_started = None;
+                    }
                     if let Some(rx) = &self.probe_receiver {
                         if let Ok((source_provider, result)) = rx.try_recv() {
                             self.probe_receiver = None;
                             match result {
                                 Ok(info) => {
                                     self.notice = format!("{} · {}", info.status, info.usage);
-                                    e.models.set(source_provider, info.models);
+                                    let first = info.models.first().cloned();
+                                    e.probe_succeeded(source_provider, info);
+                                    if source_provider == self.current_provider
+                                        && self.model.is_empty()
+                                    {
+                                        if let Some(model) = first {
+                                            self.model = model.clone();
+                                            e.settings.model = model;
+                                            e.store.save_settings(&e.settings)?;
+                                        }
+                                    }
                                 }
-                                Err(err) => self.notice = err,
+                                Err(err) => {
+                                    e.provider_failed(source_provider, &err);
+                                    self.notice = err;
+                                }
                             }
                         }
                     }
@@ -203,6 +449,7 @@ impl App {
                             .unwrap_or_else(|| ".".into());
                         let (tx, rx) = mpsc::channel();
                         self.probe_receiver = Some(rx);
+                        e.providers.get_mut(p).readiness = Readiness::Checking;
                         self.notice = "Checking official CLI connection…".into();
                         std::thread::spawn(move || {
                             let _ = tx.send((p, provider::probe(p, exe, cwd)));
@@ -215,6 +462,7 @@ impl App {
                         Provider::Claude => e.settings.claude_path.clone(),
                     };
                     provider::launch_login(p, exe)?;
+                    e.providers.get_mut(p).readiness = Readiness::Unchecked;
                     self.notice="Complete sign-in in the official CLI window, then click Refresh. No account history is imported.".into();
                 }
                 Msg::UseHistory => {
@@ -246,11 +494,18 @@ impl App {
                     e.refresh(&self.search)?;
                 }
                 Msg::Select(id) => {
+                    if let Some(session) = e.sessions.iter().find(|s| s.id == id) {
+                        self.current_provider = session.provider;
+                        self.project =
+                            (!session.project_id.is_empty()).then(|| session.project_id.clone());
+                        self.model = session.model.clone();
+                    }
                     self.selected = Some(id);
                     self.settings = false;
                 }
                 Msg::Project(id) => {
                     self.project = Some(id);
+                    self.access = AccessMode::Workspace.to_string();
                     self.selected = None;
                     self.messages.clear();
                 }
@@ -260,27 +515,128 @@ impl App {
                         .pick_folder()
                     {
                         self.project = Some(e.add_project(p.to_string_lossy().into_owned())?);
+                        self.selected = None;
+                        self.messages.clear();
+                        self.access = AccessMode::Workspace.to_string();
                     }
                 }
                 Msg::New => {
-                    let p = self.project.clone().ok_or("Add a project folder first")?;
-                    self.selected = Some(e.new_session(p)?);
+                    e.settings.provider = self.current_provider;
+                    e.settings.model = self.model.clone();
+                    self.selected = Some(if let Some(p) = self.project.clone() {
+                        e.new_session(p)?
+                    } else {
+                        e.new_general_chat()?
+                    });
                     self.settings = false;
                     self.prompt.clear();
                     self.editor = text_editor::Content::new();
                 }
                 Msg::Send => {
                     if self.selected.is_none() {
-                        self.selected = Some(e.new_session(
-                            self.project.clone().ok_or("Add a project folder first")?,
-                        )?);
+                        e.settings.provider = self.current_provider;
+                        e.settings.model = self.model.clone();
+                        self.selected = Some(if let Some(p) = self.project.clone() {
+                            e.new_session(p)?
+                        } else {
+                            e.new_general_chat()?
+                        });
                     }
                     let id = self.selected.clone().unwrap();
-                    e.send(&id, self.prompt.clone())?;
+                    let mode = parse_access(&self.access)
+                        .filter(|mode| self.project.is_some() || *mode != AccessMode::Workspace)
+                        .unwrap_or(if self.project.is_none() {
+                            AccessMode::ReadOnly
+                        } else {
+                            AccessMode::Workspace
+                        });
+                    e.send_with_options(
+                        &id,
+                        self.prompt.clone(),
+                        (!self.effort.is_empty()).then(|| self.effort.clone()),
+                        mode,
+                    )?;
                     self.prompt.clear();
                     self.editor = text_editor::Content::new();
                 }
+                Msg::GeneralChat => {
+                    self.project = None;
+                    self.selected = None;
+                    self.messages.clear();
+                    self.settings = false;
+                    self.access = AccessMode::ReadOnly.to_string();
+                }
+                Msg::ImeUpdate(composing) => {
+                    self.ime_composing = composing;
+                    self.last_ime_event = Some(Instant::now());
+                }
+                Msg::ImeCommit => {
+                    self.ime_composing = false;
+                    self.last_ime_event = Some(Instant::now());
+                }
+                Msg::Effort(value) => {
+                    if value.is_empty()
+                        || e.providers
+                            .get(self.current_provider)
+                            .efforts_for(&self.model)
+                            .contains(&value)
+                    {
+                        self.effort = value;
+                    }
+                }
+                Msg::AccessRequested(value) => {
+                    let mode = parse_access(&value).ok_or("Unsupported access setting")?;
+                    if !e
+                        .providers
+                        .get(self.current_provider)
+                        .supported_access
+                        .contains(&mode)
+                    {
+                        return Err("This provider does not expose that access mode".into());
+                    }
+                    if mode == AccessMode::Full {
+                        self.full_access_confirmation = true;
+                    } else {
+                        self.access = value;
+                    }
+                }
+                Msg::ConfirmFullAccess => {
+                    if self.full_access_confirmation {
+                        self.access = AccessMode::Full.to_string();
+                        self.full_access_confirmation = false;
+                    }
+                }
+                Msg::CancelFullAccess => self.full_access_confirmation = false,
                 Msg::Settings => self.settings = !self.settings,
+                Msg::ToggleTheme => {
+                    e.settings.light_theme = !e.settings.light_theme;
+                    self.theme_from = self.theme_mix;
+                    self.theme_target = if e.settings.light_theme { 1. } else { 0. };
+                    if e.settings.reduced_motion {
+                        self.theme_mix = self.theme_target;
+                    } else {
+                        self.theme_started = Some(Instant::now());
+                    }
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::ReducedMotion(value) => {
+                    e.settings.reduced_motion = value;
+                    e.store.save_settings(&e.settings)?;
+                    if value {
+                        self.theme_started = None;
+                        self.motion_started = None;
+                        self.theme_mix = self.theme_target;
+                    }
+                }
+                Msg::ToggleAgents => self.show_agents = !self.show_agents,
+                Msg::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+                Msg::OpenLink(url) => {
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        open_url(&url)?;
+                    } else {
+                        self.notice = "Only web links can be opened from chat".into();
+                    }
+                }
                 Msg::Provider(p) => {
                     if self
                         .selected
@@ -289,9 +645,18 @@ impl App {
                     {
                         return Err("Stop this turn before switching provider".into());
                     }
+                    self.current_provider = p;
+                    self.effort.clear();
+                    self.access = if self.project.is_some() {
+                        AccessMode::Workspace
+                    } else {
+                        AccessMode::ReadOnly
+                    }
+                    .to_string();
                     e.settings.provider = p;
                     e.settings.model.clear();
-                    self.model.clear();
+                    self.model = e.models.get(p).first().cloned().unwrap_or_default();
+                    e.settings.model = self.model.clone();
                     e.store.save_settings(&e.settings)?;
                     if let Some(id) = &self.selected {
                         if e.jobs.contains_key(id) {
@@ -316,8 +681,14 @@ impl App {
                         }
                     }
                 }
-                Msg::CodexPath(s) => e.settings.codex_path = s,
-                Msg::ClaudePath(s) => e.settings.claude_path = s,
+                Msg::CodexPath(s) => {
+                    e.settings.codex_path = s;
+                    e.providers.get_mut(Provider::Codex).readiness = Readiness::Unchecked;
+                }
+                Msg::ClaudePath(s) => {
+                    e.settings.claude_path = s;
+                    e.providers.get_mut(Provider::Claude).readiness = Readiness::Unchecked;
+                }
                 Msg::SaveSettings => {
                     e.store.save_settings(&e.settings)?;
                     self.notice="Settings saved. Sign in through the official CLI before your first message.".into();
@@ -396,7 +767,16 @@ impl App {
                     };
                     open_url(url)?;
                 }
-                Msg::Copy(_) => {}
+                Msg::Copy(_)
+                | Msg::DragWindow
+                | Msg::Minimize
+                | Msg::Maximize
+                | Msg::CloseWindow
+                | Msg::Capture(_)
+                | Msg::Resize(_)
+                | Msg::SystemMenu
+                | Msg::RequestCapture
+                | Msg::ComposerSubmit => {}
             }
             Ok(())
         })();
@@ -404,338 +784,206 @@ impl App {
             self.notice = err;
         }
         self.load();
+        self.cache_markdown();
         Task::none()
     }
     fn view(&self) -> Element<'_, Msg> {
-        let e = match &self.engine {
-            Ok(e) => e,
-            Err(err) => {
-                return container(column![
-                    text("spark-code").size(32),
-                    text("Could not open local storage"),
-                    text(err)
-                ])
-                .padding(40)
-                .into();
-            }
-        };
-        let mut sidebar = column![
-            row![
-                text("✦").size(30).color(Color::from_rgb8(254, 136, 96)),
-                text("spark-code").size(25)
-            ]
-            .spacing(10),
-            text("YOUR CODING WORKSPACE")
-                .size(10)
-                .color(Color::from_rgb8(117, 137, 161)),
-            Space::new().height(14),
-            button(text("+  New conversation").size(14))
-                .on_press(Msg::New)
-                .padding(12)
-                .width(Length::Fill),
-            text_input("Search conversations", &self.search)
-                .on_input(Msg::Search)
-                .padding(10),
-            Space::new().height(10),
-            row![
-                text("PROJECTS").size(11),
-                Space::new().width(Length::Fill),
-                button("+").on_press(Msg::AddProject)
-            ],
-        ]
-        .spacing(10);
-        for p in &e.projects {
-            let label = format!(
-                "{} {}",
-                if self.project.as_ref() == Some(&p.id) {
-                    "●"
-                } else {
-                    "○"
-                },
-                p.name
-            );
-            sidebar = sidebar.push(
-                button(text(label).size(13))
-                    .style(button::secondary)
-                    .on_press(Msg::Project(p.id.clone()))
-                    .width(Length::Fill)
-                    .padding(10),
-            );
-        }
-        if e.projects.is_empty() {
-            sidebar = sidebar
-                .push(text("Add a folder to start. Your files stay on your computer.").size(12));
-        }
-        sidebar = sidebar
-            .push(Space::new().height(12))
-            .push(text("CONVERSATIONS").size(11));
-        let mut sessions = column![].spacing(5);
-        for s in &e.sessions {
-            let running = e.jobs.contains_key(&s.id);
-            let label = format!("{} {}", if running { "◉" } else { "·" }, s.title);
-            sessions = sessions.push(
-                button(text(label).size(13))
-                    .style(if self.selected.as_ref() == Some(&s.id) {
-                        button::primary
-                    } else {
-                        button::text
-                    })
-                    .on_press(Msg::Select(s.id.clone()))
-                    .width(Length::Fill)
-                    .padding(9),
-            );
-        }
-        sidebar = sidebar
-            .push(scrollable(sessions).height(Length::Fill))
-            .push(
-                button("Settings & imports")
-                    .style(button::secondary)
-                    .on_press(Msg::Settings)
-                    .padding(11)
-                    .width(Length::Fill),
-            )
-            .push(
-                text("LOCAL FIRST  /  NO BROWSER ENGINE")
-                    .size(9)
-                    .color(Color::from_rgb8(117, 137, 161)),
-            );
-        let center = if self.preview.is_some() {
-            self.import_view()
-        } else if self.settings {
-            self.settings_view()
+        with_resize_edges(ui::view(self))
+    }
+    fn selected_provider(&self) -> Provider {
+        self.current_provider
+    }
+    fn model_name(&self) -> String {
+        if self.model.is_empty() {
+            "Choose model".into()
         } else {
-            self.chat_view()
+            self.model.clone()
+        }
+    }
+    fn provider_ready(&self, p: Provider) -> bool {
+        self.engine
+            .as_ref()
+            .is_ok_and(|e| e.providers.get(p).ready())
+    }
+    fn provider_hint(&self, p: Provider) -> String {
+        let Ok(e) = &self.engine else {
+            return "Local storage unavailable".into();
         };
-        let mut right=column![text("AGENTS").size(11),text(format!("{} / {} active",e.jobs.len(),e.concurrency)).size(22),text("Separate projects can run together. Shared folders are locked while an agent works.").size(12),Space::new().height(10)].spacing(12);
-        for (id, j) in &e.jobs {
-            let title = e
-                .sessions
-                .iter()
-                .find(|s| &s.id == id)
-                .map(|s| s.title.as_str())
-                .unwrap_or("Agent");
-            let mut card = column![
-                text(title).size(14),
-                text(&j.status).size(12),
-                button("Stop agent")
-                    .style(button::danger)
-                    .on_press(Msg::Cancel(id.clone()))
-            ]
-            .spacing(8);
-            if let Some((_, desc)) = j.approval.front() {
-                card = card.push(text(desc).size(12)).push(
-                    row![
-                        button("Allow once").on_press(Msg::Approve(id.clone(), true)),
-                        button("Deny")
-                            .style(button::secondary)
-                            .on_press(Msg::Approve(id.clone(), false))
-                    ]
-                    .spacing(5),
-                );
-            }
-            if !j.usage.is_empty() {
-                card = card.push(text(&j.usage).size(11));
-            }
-            right = right.push(container(card).style(container::rounded_box).padding(12));
-        }
-        if e.jobs.is_empty() {
-            right=right.push(container(column![text("Quiet by design").size(16),text("Provider processes launch only for work. No background account or history scans.").size(12)].spacing(8)).style(container::rounded_box).padding(14));
-        }
-        right = right
-            .push(Space::new().height(Length::Fill))
-            .push(text("SUBSCRIPTION CONNECTIONS").size(10))
-            .push(text("Codex / ChatGPT\nClaude Code").size(13))
-            .push(
-                text(
-                    "Usage appears only when the provider exposes it. Quotas cannot be reset here.",
-                )
-                .size(11),
-            );
-        container(
-            row![
-                container(sidebar)
-                    .padding(22)
-                    .width(260)
-                    .height(Length::Fill)
-                    .style(container::rounded_box),
-                container(center)
-                    .padding(28)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                container(right)
-                    .padding(18)
-                    .width(236)
-                    .height(Length::Fill)
-                    .style(container::rounded_box)
-            ]
-            .spacing(1),
-        )
-        .into()
+        let state = e.providers.get(p);
+        match state.readiness{Readiness::Ready=>"Connected with your subscription".into(),Readiness::Checking=>"Checking the official CLI connection…".into(),Readiness::Unchecked=>"Open Settings and Refresh this provider. Install its official CLI or sign in if needed.".into(),_=>format!("{} Open Settings to install, sign in, or troubleshoot, then Refresh.",state.status)}
     }
-    fn chat_view(&self) -> Element<'_, Msg> {
-        let e = self.engine.as_ref().unwrap();
-        let ses = self
-            .selected
+    fn usage_fraction(&self, p: Provider) -> Option<f32> {
+        self.engine
             .as_ref()
-            .and_then(|id| e.sessions.iter().find(|s| &s.id == id));
-        let title = ses
-            .map(|s| s.title.as_str())
-            .unwrap_or("A little spark. A lot of possibility.");
-        let p = self
-            .project
-            .as_ref()
-            .and_then(|id| e.projects.iter().find(|p| &p.id == id));
-        let provider = ses.map(|s| s.provider).unwrap_or(e.settings.provider);
-        let mut content = column![
-            text(title).size(26),
-            text(
-                p.map(|p| p.path.as_str())
-                    .unwrap_or("Choose a project folder to begin")
-            )
-            .size(12)
-            .color(Color::from_rgb8(127, 146, 167)),
-            Space::new().height(12)
-        ]
-        .spacing(10);
-        let mut transcript = column![].spacing(18);
-        if self.messages.is_empty() {
-            transcript=transcript.push(container(column![text("Build something worth opening.").size(23),text("Ask your coding agent to explore a project, fix a bug, or make something new. You review sensitive tool requests as they arrive.").size(15),Space::new().height(8),row![button("Add project folder").on_press(Msg::AddProject).padding(12),button("Connect a provider").style(button::secondary).on_press(Msg::Settings).padding(12)].spacing(12)].spacing(15)).padding(30).style(container::rounded_box));
-        }
-        for m in &self.messages {
-            let label = match m.role.as_str() {
-                "user" => "YOU",
-                "assistant" => "AGENT",
-                _ => "NOTICE",
+            .ok()?
+            .providers
+            .get(p)
+            .usage_windows
+            .first()
+            .map(|w| (w.used_percent / 100.).clamp(0., 1.))
+    }
+    fn usage_label(&self, p: Provider) -> String {
+        let Ok(e) = &self.engine else {
+            return "Unavailable".into();
+        };
+        let s = e.providers.get(p);
+        if s.usage_windows.is_empty() {
+            if s.checked_at == 0 {
+                return s.readiness.to_string();
+            }
+            return if s.usage_note.is_empty() {
+                "Usage unavailable".into()
+            } else {
+                s.usage_note.clone()
             };
-            transcript = transcript.push(
-                column![
-                    row![
-                        text(label).size(10).color(Color::from_rgb8(86, 203, 177)),
-                        Space::new().width(Length::Fill),
-                        button("Copy")
-                            .style(button::text)
-                            .on_press(Msg::Copy(m.text.clone()))
-                    ],
-                    text(&m.text).size(14)
-                ]
-                .spacing(6),
-            );
         }
-        if let Some(j) = self.selected.as_ref().and_then(|id| e.jobs.get(id)) {
-            if !j.draft.text.is_empty() {
-                transcript = transcript.push(
-                    column![
-                        text("AGENT  ·  streaming")
-                            .size(10)
-                            .color(Color::from_rgb8(254, 136, 96)),
-                        text(&j.draft.text).size(14)
-                    ]
-                    .spacing(6),
+        let labels = s
+            .usage_windows
+            .iter()
+            .map(|w| {
+                let reset = w
+                    .resets_at
+                    .map(|at| format!(" · {}", reset_label(at)))
+                    .unwrap_or_default();
+                format!("{}: {:.0}% used{}", w.label, w.used_percent, reset)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if s.is_stale() {
+            format!("{labels} · last known")
+        } else {
+            labels
+        }
+    }
+    fn supported_efforts(&self) -> Vec<String> {
+        self.engine
+            .as_ref()
+            .map(|e| {
+                e.providers
+                    .get(self.current_provider)
+                    .efforts_for(&self.model)
+                    .to_vec()
+            })
+            .unwrap_or_default()
+    }
+    fn access_choices(&self) -> Vec<String> {
+        self.engine
+            .as_ref()
+            .map(|e| {
+                e.providers
+                    .get(self.current_provider)
+                    .supported_access
+                    .iter()
+                    .filter(|m| self.project.is_some() || **m != AccessMode::Workspace)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn send_hint(&self) -> String {
+        if !self.provider_ready(self.current_provider) {
+            return self.provider_hint(self.current_provider);
+        }
+        let Ok(e) = &self.engine else {
+            return "Storage unavailable".into();
+        };
+        if self.model.is_empty() || !e.models.get(self.current_provider).contains(&self.model) {
+            return "Choose an available model after refreshing the provider in Settings".into();
+        }
+        if self.ime_composing {
+            return "Finish composing your text before sending".into();
+        }
+        if self.prompt.trim().is_empty() {
+            return "Write a message first".into();
+        }
+        String::new()
+    }
+    fn can_send(&self) -> bool {
+        self.send_hint().is_empty()
+            && !self.full_access_confirmation
+            && self
+                .selected
+                .as_ref()
+                .is_none_or(|id| self.engine.as_ref().is_ok_and(|e| !e.jobs.contains_key(id)))
+    }
+
+    fn colors(&self) -> Colors {
+        Colors::at(self.theme_mix)
+    }
+    fn theme(&self) -> Theme {
+        let c = self.colors();
+        Theme::custom(
+            "Spark",
+            iced::theme::Palette {
+                background: c.bg,
+                text: c.text,
+                primary: c.text,
+                success: Color::from_rgb8(78, 174, 126),
+                warning: Color::from_rgb8(227, 177, 85),
+                danger: Color::from_rgb8(219, 86, 94),
+            },
+        )
+    }
+    fn motion_progress(&self) -> f32 {
+        self.motion_started
+            .map(|t| (t.elapsed().as_secs_f32() / 0.18).min(1.))
+            .unwrap_or(1.)
+    }
+    fn cache_markdown(&mut self) {
+        for m in &self.messages {
+            if self
+                .rendered
+                .get(&m.id)
+                .is_none_or(|(len, _)| *len != m.text.len())
+            {
+                self.rendered.insert(
+                    m.id.clone(),
+                    (m.text.len(), markdown::Content::parse(&m.text)),
                 );
             }
         }
-        let running = self
-            .selected
+        if let Some(j) = self
+            .engine
             .as_ref()
-            .is_some_and(|id| e.jobs.contains_key(id));
-        if ses.is_some_and(|s| s.id.starts_with("t3:") && s.remote_id.is_none()) {
-            content = content.push(
-                button("Use recent imported text in draft")
-                    .style(button::secondary)
-                    .on_press(Msg::UseHistory),
-            );
+            .ok()
+            .and_then(|e| self.selected.as_ref().and_then(|id| e.jobs.get(id)))
+        {
+            let entry = self
+                .rendered
+                .entry(j.draft.id.clone())
+                .or_insert_with(|| (0, markdown::Content::default()));
+            if entry.0 < j.draft.text.len() {
+                entry.1.push_str(&j.draft.text[entry.0..]);
+                entry.0 = j.draft.text.len();
+            }
         }
-        content = content
-            .push(scrollable(transcript).height(Length::Fill))
-            .push(
-                row![
-                    pick_list(Provider::ALL, Some(provider), Msg::Provider).padding(8),
-                    pick_list(
-                        e.models.get(provider),
-                        e.models.get(provider).iter().find(|m| *m == &self.model),
-                        Msg::Model
-                    )
-                    .placeholder("Available models")
-                    .padding(8),
-                    text_input("Model or default", &self.model)
-                        .on_input(Msg::Model)
-                        .padding(9)
-                ]
-                .spacing(10),
-            )
-            .push(
-                row![
-                    text_editor(&self.editor)
-                        .placeholder("What would you like to build?  (Ctrl+Enter to send)")
-                        .on_action(Msg::Edit)
-                        .height(100)
-                        .padding(12),
-                    button(if running { "Working…" } else { "Send ↑" })
-                        .on_press_maybe((!running).then_some(Msg::Send))
-                        .padding(17)
-                ]
-                .spacing(10),
-            )
-            .push(
-                text(if !self.notice.is_empty() {
-                    &self.notice
-                } else {
-                    &e.notice
-                })
-                .size(11),
-            );
-        content.into()
-    }
-    fn settings_view(&self) -> Element<'_, Msg> {
-        let e = self.engine.as_ref().unwrap();
-        scrollable(column![text("Settings").size(30),text("Your tools. Your accounts. Your machine.").size(14),Space::new().height(12),text("Provider connections").size(20),text("Install the official native CLI and sign in through its own login flow. spark-code does not store passwords, tokens or API keys. Existing subscription access is checked before a prompt is sent.").size(13),row![text("Codex executable").width(150),text_input("codex",&e.settings.codex_path).on_input(Msg::CodexPath).padding(10)].spacing(8),row![text("Claude executable").width(150),text_input("claude",&e.settings.claude_path).on_input(Msg::ClaudePath).padding(10)].spacing(8),row![button("Codex setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Codex)),button("Claude setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Claude))].spacing(10),text("In a terminal, run: codex login  ·  claude auth login\nNative .exe paths are supported on Windows. Shell scripts and .cmd wrappers are rejected for safe argument handling.").size(12),button("Save connection settings").on_press(Msg::SaveSettings).padding(12),row![button("Sign in to Codex").on_press(Msg::Login(Provider::Codex)),button("Refresh Codex").style(button::secondary).on_press_maybe(self.probe_receiver.is_none().then_some(Msg::Probe(Provider::Codex)))].spacing(10),row![button("Sign in to Claude").on_press(Msg::Login(Provider::Claude)),button("Refresh Claude").style(button::secondary).on_press_maybe(self.probe_receiver.is_none().then_some(Msg::Probe(Provider::Claude)))].spacing(10),Space::new().height(15),text("Agent capacity").size(20),row![text("Concurrent agents (1–4)").width(220),text_input("2",&e.concurrency.to_string()).on_input(Msg::Concurrency).padding(8).width(80)].spacing(10),text("More agents means more memory and subscription usage. One active agent per project folder prevents colliding edits.").size(12),Space::new().height(15),text("Import & export").size(20),text("Nothing is imported automatically. Preview and choose conversations before adding them. T3 imports preserve transcript text and project paths; they start fresh provider sessions. Codex imports use its official history API for the selected project.").size(13),row![button("Choose backup file…").on_press_maybe((!self.importing).then_some(Msg::ImportFile)).padding(11),button("Preview Codex history").on_press_maybe((!self.importing).then_some(Msg::ImportCodex)).style(button::secondary).padding(11)].spacing(10),button("Export spark-code history…").style(button::secondary).on_press(Msg::Export).padding(11),text(if self.importing{"Reading selected history…"}else{&self.notice}).size(12),Space::new().height(10),text("Privacy & limits").size(20),text("Local transcripts are unencrypted in your Windows user profile. Exported backups include messages and paths. Back them up privately. Claude Code on native Windows does not provide an OS-level sandbox; review tool requests carefully. spark-code is independent of OpenAI and Anthropic.").size(12)].spacing(14)).into()
-    }
-    fn import_view(&self) -> Element<'_, Msg> {
-        let b = self.preview.as_ref().unwrap();
-        let mut choices = column![].spacing(12);
-        for s in &b.sessions {
-            let project = b
-                .projects
-                .iter()
-                .find(|p| p.id == s.project_id)
-                .map(|p| p.name.as_str())
-                .unwrap_or("Project");
-            choices = choices.push(
-                checkbox(self.chosen.contains(&s.id))
-                    .label(format!("{}  /  {}", project, s.title))
-                    .on_toggle({
-                        let id = s.id.clone();
-                        move |v| Msg::ToggleImport(id.clone(), v)
-                    }),
-            );
+        let mut retain: HashSet<String> = self.messages.iter().map(|m| m.id.clone()).collect();
+        if let Some(j) = self
+            .engine
+            .as_ref()
+            .ok()
+            .and_then(|e| self.selected.as_ref().and_then(|id| e.jobs.get(id)))
+        {
+            retain.insert(j.draft.id.clone());
         }
-        column![
-            text("Review your import").size(28),
-            text(format!(
-                "{} projects · {} conversations · {} messages",
-                b.projects.len(),
-                b.sessions.len(),
-                b.messages.len()
-            ))
-            .size(14),
-            text("Only selected conversations will be added. Source data stays unchanged.")
-                .size(12),
-            scrollable(choices).height(Length::Fill),
-            row![
-                button(text(format!("Import {} selected", self.chosen.len())))
-                    .on_press(Msg::ConfirmImport)
-                    .padding(12),
-                button("Cancel")
-                    .style(button::secondary)
-                    .on_press(Msg::CloseImport)
-                    .padding(12)
-            ]
-            .spacing(10)
-        ]
-        .spacing(18)
-        .into()
+        self.rendered.retain(|id, _| retain.contains(id));
     }
 }
+fn save_capture(path: &str, shot: &iced::window::Screenshot) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        shot.size.width,
+        shot.size.height,
+    );
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+    writer
+        .write_image_data(&shot.rgba)
+        .map_err(|e| e.to_string())
+}
+
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut c = {
@@ -751,4 +999,192 @@ fn open_url(url: &str) -> Result<(), String> {
     };
     c.spawn().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn parse_access(value: &str) -> Option<AccessMode> {
+    [
+        AccessMode::ChatOnly,
+        AccessMode::ReadOnly,
+        AccessMode::Workspace,
+        AccessMode::Full,
+    ]
+    .into_iter()
+    .find(|m| m.to_string() == value)
+}
+fn reset_label(timestamp: i64) -> String {
+    let left = timestamp.saturating_sub(now());
+    if left <= 0 {
+        "reset due · Refresh".into()
+    } else if left < 3600 {
+        format!("resets in {}m", (left + 59) / 60)
+    } else {
+        format!("resets in {}h {}m", left / 3600, (left % 3600) / 60)
+    }
+}
+fn capture_destination(path: &str, light: bool, settings: bool, chat: bool) -> String {
+    let mut p = path.to_string();
+    if light {
+        p = p.replace("-dark-", "-light-");
+    }
+    if settings {
+        p = p.replace(".png", "-settings.png");
+    } else if chat {
+        p = p.replace(".png", "-chat.png");
+    }
+    p
+}
+fn composer_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Msg>> {
+    use iced::keyboard::{Key, key::Named};
+    if !matches!(event.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    if event.key == Key::Named(Named::Enter) && !event.modifiers.shift() && !event.modifiers.alt() {
+        Some(text_editor::Binding::Custom(Msg::ComposerSubmit))
+    } else {
+        text_editor::Binding::from_key_press(event)
+    }
+}
+fn with_resize_edges(main: Element<'_, Msg>) -> Element<'_, Msg> {
+    use iced::widget::{mouse_area, stack};
+    use iced::{Alignment, mouse::Interaction, window::Direction};
+    let edge = |direction, cursor, w: Length, h: Length, x, y| {
+        container(
+            mouse_area(Space::new().width(w).height(h))
+                .interaction(cursor)
+                .on_press(Msg::Resize(direction)),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(x)
+        .align_y(y)
+    };
+    stack![
+        main,
+        edge(
+            Direction::North,
+            Interaction::ResizingVertically,
+            Length::Fill,
+            4.into(),
+            Alignment::Start,
+            Alignment::Start
+        ),
+        edge(
+            Direction::South,
+            Interaction::ResizingVertically,
+            Length::Fill,
+            4.into(),
+            Alignment::Start,
+            Alignment::End
+        ),
+        edge(
+            Direction::West,
+            Interaction::ResizingHorizontally,
+            4.into(),
+            Length::Fill,
+            Alignment::Start,
+            Alignment::Start
+        ),
+        edge(
+            Direction::East,
+            Interaction::ResizingHorizontally,
+            4.into(),
+            Length::Fill,
+            Alignment::End,
+            Alignment::Start
+        ),
+        edge(
+            Direction::NorthWest,
+            Interaction::ResizingDiagonallyDown,
+            8.into(),
+            8.into(),
+            Alignment::Start,
+            Alignment::Start
+        ),
+        edge(
+            Direction::NorthEast,
+            Interaction::ResizingDiagonallyUp,
+            8.into(),
+            8.into(),
+            Alignment::End,
+            Alignment::Start
+        ),
+        edge(
+            Direction::SouthWest,
+            Interaction::ResizingDiagonallyUp,
+            8.into(),
+            8.into(),
+            Alignment::Start,
+            Alignment::End
+        ),
+        edge(
+            Direction::SouthEast,
+            Interaction::ResizingDiagonallyDown,
+            8.into(),
+            8.into(),
+            Alignment::End,
+            Alignment::End
+        ),
+    ]
+    .into()
+}
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    fn key(shift: bool, focused: bool) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            modifiers: if shift {
+                iced::keyboard::Modifiers::SHIFT
+            } else {
+                iced::keyboard::Modifiers::empty()
+            },
+            text: None,
+            status: if focused {
+                text_editor::Status::Focused { is_hovered: true }
+            } else {
+                text_editor::Status::Active
+            },
+        }
+    }
+    #[test]
+    fn enter_submits_only_focused_composer() {
+        assert!(matches!(
+            composer_binding(key(false, true)),
+            Some(text_editor::Binding::Custom(Msg::ComposerSubmit))
+        ));
+        assert!(composer_binding(key(false, false)).is_none());
+    }
+    #[test]
+    fn shift_enter_remains_newline() {
+        assert!(matches!(
+            composer_binding(key(true, true)),
+            Some(text_editor::Binding::Enter)
+        ));
+    }
+    #[test]
+    fn access_parser_rejects_unadvertised_strings() {
+        assert!(parse_access("bypass-permissions").is_none());
+    }
+}
+fn submission_blocked_by_ime(composing: bool, last_event_age: Option<Duration>) -> bool {
+    composing || last_event_age.is_some_and(|age| age < Duration::from_millis(300))
+}
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    #[test]
+    fn composition_confirmation_cannot_send() {
+        assert!(submission_blocked_by_ime(true, None));
+        assert!(submission_blocked_by_ime(
+            false,
+            Some(Duration::from_millis(5))
+        ));
+        assert!(!submission_blocked_by_ime(
+            false,
+            Some(Duration::from_millis(400))
+        ));
+        assert!(!submission_blocked_by_ime(false, None));
+    }
 }
