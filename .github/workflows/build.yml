@@ -68,6 +68,9 @@ jobs:
     name: Windows x64 setup and portable
     runs-on: windows-2022
     timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read # Read the explicitly selected recovery artifact from this repository.
     env:
       # Avoid requiring the separate MSVC Redistributable for these binaries.
       RUSTFLAGS: -C target-feature=+crt-static
@@ -76,6 +79,77 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+          fetch-depth: 2 # Only the release-repair commit and its direct parent are eligible.
+      - name: Verify narrowly scoped Windows binary recovery
+        id: windows-recovery
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'release: spark-code 1.1.0')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo 'reuse=false' >> "$GITHUB_OUTPUT"
+          source=d7ce1e58b78208824fcaa199119fe97b20410041
+          # This one-off repair can reuse only its direct parent's binaries.
+          if [[ "$(git rev-parse HEAD^)" != "$source" ]]; then
+            echo 'Not the one-off recovery commit; compiling normally.'
+            exit 0
+          fi
+          inputs=(Cargo.toml Cargo.lock build.rs src assets .cargo)
+          if git diff --quiet "$source" HEAD -- "${inputs[@]}"; then
+            echo 'All listed compile inputs are byte-identical to the recovered build.'
+          else
+            result=$?
+            [[ "$result" == 1 ]] || exit "$result"
+            echo 'Compile inputs changed; compiling normally.'
+            exit 0
+          fi
+          mkdir -p dist
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11244755304" > dist/windows-recovery-artifact.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37045100936/jobs?per_page=100" > dist/windows-recovery-jobs.json
+          python - <<'PYRECOVERY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          source = 'd7ce1e58b78208824fcaa199119fe97b20410041'
+          artifact = json.loads(Path('dist/windows-recovery-artifact.json').read_text(encoding='utf-8-sig'))
+          assert artifact['id'] == 11244755304 and not artifact['expired'], 'Recovery artifact is missing or expired'
+          assert artifact['name'] == 'spark-code-windows-binaries-' + source, 'Unexpected recovery artifact name'
+          assert artifact['workflow_run']['id'] == 37045100936, 'Unexpected recovery run'
+          assert artifact['workflow_run']['head_sha'] == source, 'Unexpected recovery source commit'
+          jobs = json.loads(Path('dist/windows-recovery-jobs.json').read_text(encoding='utf-8-sig'))['jobs']
+          windows_jobs = [job for job in jobs if job['name'] == 'Windows x64 setup and portable']
+          assert len(windows_jobs) == 1, 'Expected exactly one source Windows job'
+          job = windows_jobs[0]
+          assert job['head_sha'] == source and job['run_id'] == 37045100936 and job['status'] == 'completed', 'Unexpected source job identity/state'
+          reused_checks = ['Run cargo fmt --all -- --check',
+              'Run cargo test --locked --target x86_64-pc-windows-msvc --all-targets',
+              'Run cargo build --locked --release --target x86_64-pc-windows-msvc --bins']
+          for command in reused_checks:
+              matches = [step for step in job['steps'] if step['name'] == command]
+              assert len(matches) == 1 and matches[0]['conclusion'] == 'success', 'Source check did not pass: ' + command
+          old_workflow = subprocess.check_output(['git', 'show', source + ':.github/workflows/build.yml'], text=True)
+          old_flags = re.findall(r'^      RUSTFLAGS: (.+)$', old_workflow, re.MULTILINE)
+          assert old_flags == [os.environ['RUSTFLAGS']], 'Recovery compilation flags differ'
+          digest = artifact.get('digest', '')
+          assert digest == 'sha256:990c2622bdf0473a178ac9c543279038a26508928d03ddc6e7aec16c957aca5a', 'Recovery artifact digest differs from independently verified bytes'
+          provenance = dict(reusedBinaryCommit=source, compileInputsIdentical=True,
+              verifiedCompileInputs=['Cargo.toml', 'Cargo.lock', 'build.rs', 'src', 'assets', '.cargo'],
+              reusedBinaryRunId=37045100936, reusedBinaryArtifactId=11244755304,
+              reusedBinaryArtifactDigest=digest, verifiedRustFlags=os.environ['RUSTFLAGS'],
+              reusedValidationJobId=job['id'], reusedSuccessfulChecks=reused_checks)
+          Path('dist/windows-recovery.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
+          PYRECOVERY
+          echo 'reuse=true' >> "$GITHUB_OUTPUT"
+      - name: Download only the verified Windows recovery binaries
+        if: steps.windows-recovery.outputs.reuse == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: '11244755304'
+          run-id: '37045100936'
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: target/x86_64-pc-windows-msvc/release
       - name: Select Rust stable
         shell: pwsh
         run: |
@@ -85,9 +159,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version --verbose
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked --target x86_64-pc-windows-msvc --all-targets
-      - run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
+      - name: Test Windows sources unless identical tested inputs were recovered
+        if: steps.windows-recovery.outputs.reuse != 'true'
+        run: cargo test --locked --target x86_64-pc-windows-msvc --all-targets
+      - name: Compile Windows release unless exact inputs were recovered
+        if: steps.windows-recovery.outputs.reuse != 'true'
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
       - name: Preserve exact compiled Windows binaries for recovery
+        if: steps.windows-recovery.outputs.reuse != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: spark-code-windows-binaries-${{ github.sha }}
@@ -106,7 +185,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'CLI PE resource validation failed' }
           $help = & ./target/x86_64-pc-windows-msvc/release/spark-code.exe --help
           if ($LASTEXITCODE -ne 0 -or $help[0] -cne 'spark-code 1.1.0') { throw 'CLI release version mismatch' }
-          [ordered]@{ platform = 'windows'; version = '1.1.0'; commit = $env:GITHUB_SHA; cliVersionPassed = $true } | ConvertTo-Json | Set-Content -Encoding utf8 dist/windows-build.json
+          $build = [ordered]@{ platform = 'windows'; version = '1.1.0'; commit = $env:GITHUB_SHA; binaryCommit = $env:GITHUB_SHA; cliVersionPassed = $true }
+          if (Test-Path dist/windows-recovery.json) {
+            $recovery = Get-Content -Raw dist/windows-recovery.json | ConvertFrom-Json -AsHashtable
+            foreach ($entry in $recovery.GetEnumerator()) { $build[$entry.Key] = $entry.Value }
+            $build.binaryCommit = $recovery.reusedBinaryCommit
+          }
+          $build | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 dist/windows-build.json
       - name: Check native window chrome and repeated state changes
         shell: pwsh
         run: ./packaging/test-window-chrome.ps1

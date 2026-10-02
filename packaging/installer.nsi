@@ -6,8 +6,8 @@ Unicode true
 !include "WinVer.nsh"
 !include "x64.nsh"
 !include "WinMessages.nsh"
-!include "Win/COM.nsh"
-!include "Win/Propkey.nsh"
+!include "Win\COM.nsh"
+!include "Win\Propkey.nsh"
 !include "${PAYLOAD_INCLUDE}"
 
 Name "Spark Code"
