@@ -1,4 +1,4 @@
-# spark-code
+# spark-code 1.0.0
 
 A lightweight native Windows 10 coding workspace with desktop and terminal interfaces. Built in Rust with no Electron or bundled browser.
 
@@ -13,7 +13,7 @@ A lightweight native Windows 10 coding workspace with desktop and terminal inter
 
 ## Start
 
-Install the Windows setup, or unzip the portable package and open `spark-code-desktop.exe`.
+Download Windows setup, portable ZIP, or Linux x86_64 archive from [Releases](https://github.com/itarqos5/spark-code/releases/tag/v1.0.0). On Windows, install setup or unzip and open `spark-code-desktop.exe`.
 In a new terminal, run `spark-code` for the TUI or `spark-code gui` for the desktop.
 
 Use Settings to point to official native Codex / Claude Code executables, launch their own sign-in, and Refresh. No provider install or sign-in happens automatically.

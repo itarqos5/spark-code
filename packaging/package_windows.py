@@ -214,6 +214,10 @@ def main():
             shutil.copy2(notice, payload / f"RUNTIME-NOTICE-{index + 1}-{notice.name}")
         shutil.copy2(repository / "LICENSE", payload / "LICENSE")
         shutil.copy2(repository / "docs" / "INSTALL.md", payload / "INSTALL.md")
+        shutil.copy2(repository / "docs" / "FEATURES.md", payload / "FEATURES.md")
+        release_notes = repository / "docs" / f"RELEASE_NOTES_v{version}.md"
+        if release_notes.is_file():
+            shutil.copy2(release_notes, payload / "RELEASE_NOTES.md")
         shutil.copy2(repository / "packaging" / "manage-user-path.ps1", payload / "manage-user-path.ps1")
         dependency_notices(args.cargo_metadata, payload)
         (payload / "runtime-dependencies.json").write_text(json.dumps(audited, indent=2) + "\n", encoding="utf-8")

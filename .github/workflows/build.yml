@@ -3,7 +3,6 @@ name: Build and package
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -19,15 +18,15 @@ env:
 
 jobs:
   linux-tests:
-    name: Linux tests and format
+    name: Linux x64 build, tests and package
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libx11-xcb-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libx11-xcb-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev xvfb xauth xdotool libxkbcommon-x11-0
       - name: Select Rust stable
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt
@@ -37,6 +36,29 @@ jobs:
       - run: cargo test --locked --all-targets
       - name: Test packaging helpers
         run: python3 -m unittest discover -s packaging -p 'test_*.py' -v
+      - name: Build native Linux release
+        run: cargo build --locked --release --bins
+      - name: Package native Linux release
+        run: |
+          mkdir -p dist
+          cargo metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu > dist/linux-cargo-metadata.json
+          python3 packaging/package_linux.py --cargo-metadata dist/linux-cargo-metadata.json
+      - name: Smoke-test packaged Linux CLI and GUI
+        run: |
+          mkdir -p dist/linux-smoke-unpack
+          tar -xzf dist/spark-code-1.0.0-linux-x64.tar.gz -C dist/linux-smoke-unpack
+          xvfb-run -a -s '-screen 0 1280x900x24' python3 packaging/smoke_linux.py --binary-dir dist/linux-smoke-unpack/spark-code-1.0.0-linux-x64
+      - name: Upload Linux archive, checksums, and smoke report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spark-code-linux-x64-${{ github.sha }}
+          path: |
+            dist/*-linux-x64.tar.gz
+            dist/*-linux-x64-SHA256SUMS.txt
+            dist/linux-smoke.json
+          if-no-files-found: error
+          retention-days: 30
 
   windows-package:
     name: Windows x64 setup and portable
@@ -85,3 +107,33 @@ jobs:
             dist/windows-smoke.json
           if-no-files-found: error
           retention-days: 30
+
+  release-v1:
+    name: Publish requested 1.0.0 release
+    needs: [linux-tests, windows-package]
+    # Only the explicitly named release commit on main can create this fixed release.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'release: spark-code 1.0.0')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-spark-code-v1.0.0
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: spark-code-windows-x64-${{ github.sha }}
+          path: release-assets
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: spark-code-linux-x64-${{ github.sha }}
+          path: release-assets
+      - name: Verify both platforms and publish v1.0.0 once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash packaging/release-v1.0.0.sh
