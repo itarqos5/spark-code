@@ -595,10 +595,10 @@ mod tests {
         assert!(e.sessions[0].project_id.is_empty());
         e.send(&id, "hello".into()).unwrap();
         let run = e.jobs.get(&id).unwrap();
-        assert!(
-            run.canonical_path
-                .starts_with(e.lock_dir.join("general-chat"))
-        );
+        // Windows canonicalization adds a verbatim path prefix, so compare
+        // canonical paths on both sides rather than differing representations.
+        let general_root = e.lock_dir.join("general-chat").canonicalize().unwrap();
+        assert!(run.canonical_path.starts_with(general_root));
         assert!(
             !e.projects
                 .iter()
