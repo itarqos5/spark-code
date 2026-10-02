@@ -215,18 +215,22 @@ def main():
         shutil.copy2(repository / "LICENSE", payload / "LICENSE")
         shutil.copy2(repository / "docs" / "INSTALL.md", payload / "INSTALL.md")
         shutil.copy2(repository / "docs" / "FEATURES.md", payload / "FEATURES.md")
+        shutil.copy2(repository / "docs" / "BRANDING.md", payload / "BRANDING.md")
+        font_license = payload / "licenses" / "inter"
+        font_license.mkdir(parents=True)
+        shutil.copy2(repository / "assets" / "fonts" / "OFL.txt", font_license / "OFL.txt")
         release_notes = repository / "docs" / f"RELEASE_NOTES_v{version}.md"
         if release_notes.is_file():
             shutil.copy2(release_notes, payload / "RELEASE_NOTES.md")
         shutil.copy2(repository / "packaging" / "manage-user-path.ps1", payload / "manage-user-path.ps1")
         dependency_notices(args.cargo_metadata, payload)
         (payload / "runtime-dependencies.json").write_text(json.dumps(audited, indent=2) + "\n", encoding="utf-8")
-        manifest = {"application": "spark-code", "version": version, "architecture": "x86_64", "target_platform": "Windows 10/11 x64", "runtime_compatibility": "Requires actual Windows validation; packaging alone does not establish compatibility.", "files": {str(p.relative_to(payload)).replace("\\", "/"): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(payload.rglob("*")) if p.is_file()}}
+        manifest = {"application": "Spark Code", "command": "spark-code", "app_user_model_id": "SparkCode.Desktop", "version": version, "architecture": "x86_64", "target_platform": "Windows 10/11 x64", "runtime_compatibility": "Requires actual Windows validation; packaging alone does not establish compatibility.", "files": {str(p.relative_to(payload)).replace("\\", "/"): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(payload.rglob("*")) if p.is_file()}}
         (payload / "package-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         include = stage / "payload.nsh"
         write_payload_include(payload, include)
         flag = "/D" if os.name == "nt" else "-D"
-        command = [args.makensis, f"{flag}VERSION={version}", f'{flag}VERSION_QUAD={".".join(match.groups())}.0', f"{flag}OUTPUT_FILE={installer}", f"{flag}PAYLOAD_INCLUDE={include}", str(repository / "packaging" / "installer.nsi")]
+        command = [args.makensis, f"{flag}VERSION={version}", f'{flag}VERSION_QUAD={".".join(match.groups())}.0', f"{flag}OUTPUT_FILE={installer}", f"{flag}PAYLOAD_INCLUDE={include}", f"{flag}APP_ICON={repository / 'assets' / 'branding' / 'spark-code.ico'}", str(repository / "packaging" / "installer.nsi")]
         subprocess.run(command, check=True, cwd=repository)
         if not installer.is_file():
             raise RuntimeError("NSIS did not produce the installer")
