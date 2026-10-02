@@ -7,7 +7,7 @@
 //! https://github.com/anthropics/claude-agent-sdk-python/tree/main/src/claude_agent_sdk/_internal
 //! The Claude wire format is implemented against the unmodified CLI, not the SDK.
 
-use crate::model::{Backup, MAX_MESSAGE_BYTES, Message, Project, Provider, Session, new_id};
+use crate::model::{Backup, MAX_MESSAGE_BYTES, Message, Project, Provider, Session};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -62,6 +62,7 @@ pub struct Handle {
     pub events: Receiver<ProviderEvent>,
     pub commands: SyncSender<ProviderCommand>,
     cancelled: Arc<AtomicBool>,
+    finished: Receiver<()>,
 }
 impl Handle {
     /// Nonblocking cancellation, including while the output queue is backpressured.
@@ -69,10 +70,21 @@ impl Handle {
         self.cancelled.store(true, Ordering::Release);
         let _ = self.commands.try_send(ProviderCommand::Cancel);
     }
+
+    /// Bounded shutdown barrier for application exit. Cancel all handles first
+    /// so their cleanup runs concurrently, then wait. Normal UI polling must
+    /// not call this; already-completed workers return immediately.
+    pub fn wait_for_shutdown(&self) -> bool {
+        self.cancel();
+        match self.finished.recv_timeout(Duration::from_secs(3)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.cancel();
+        let _ = self.wait_for_shutdown();
     }
 }
 
@@ -81,6 +93,7 @@ pub fn start(config: RunConfig) -> Result<Handle, String> {
     validate(&config)?;
     let (event_tx, events) = mpsc::sync_channel(256);
     let (commands, command_rx) = mpsc::sync_channel(16);
+    let (finished_tx, finished) = mpsc::sync_channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     thread::Builder::new()
@@ -100,12 +113,16 @@ pub fn start(config: RunConfig) -> Result<Handle, String> {
                 }
             }
             let _ = sink.tx.try_send(ProviderEvent::Done);
+            // run_* has returned, so every owned Transport/AuthChild has already
+            // closed or killed and reaped its CLI before completion is signalled.
+            let _ = finished_tx.try_send(());
         })
         .map_err(|_| "Could not start provider worker".to_string())?;
     Ok(Handle {
         events,
         commands,
         cancelled,
+        finished,
     })
 }
 
@@ -1154,13 +1171,18 @@ pub fn import_codex(executable: String, cwd: String) -> Result<Backup, String> {
     if !Path::new(&cwd).is_dir() {
         return Err("Select an existing project folder first".into());
     }
+    let cwd = Path::new(&cwd)
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .into_owned();
     let mut transport = Transport::spawn(&executable, &cwd, &["app-server".into()])?;
     let mut seq = 0;
     transport.send(initialization())?;
     import_response(&transport, seq)?;
     transport.send(json!({"method":"initialized","params":{}}))?;
     let project = Project {
-        id: new_id(),
+        id: format!("codex-project:{cwd}"),
         name: Path::new(&cwd)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1212,6 +1234,7 @@ pub fn import_codex(executable: String, cwd: String) -> Result<Backup, String> {
                 Provider::Codex,
                 t["model"].as_str().unwrap_or("").into(),
             );
+            session.id = format!("codex:{id}");
             session.remote_id = Some(id.into());
             session.title = truncate(
                 t["name"]
@@ -1222,9 +1245,9 @@ pub fn import_codex(executable: String, cwd: String) -> Result<Backup, String> {
             );
             session.updated = t["updatedAt"].as_i64().unwrap_or(session.updated);
             if let Some(turns) = t["turns"].as_array() {
-                for turn in turns {
+                for (turn_index, turn) in turns.iter().enumerate() {
                     if let Some(items) = turn["items"].as_array() {
-                        for item in items {
+                        for (item_index, item) in items.iter().enumerate() {
                             let (role, text) = match item["type"].as_str() {
                                 Some("agentMessage") => {
                                     ("assistant", item["text"].as_str().unwrap_or("").to_owned())
@@ -1253,7 +1276,13 @@ pub fn import_codex(executable: String, cwd: String) -> Result<Backup, String> {
                             {
                                 return Err("Codex import exceeded safe history limits; use a smaller explicit export instead".into());
                             }
-                            backup.messages.push(Message::new(&session.id, role, text));
+                            let mut message = Message::new(&session.id, role, text);
+                            let item_key = item["id"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("{turn_index}:{item_index}"));
+                            message.id = format!("codex:{id}:{item_key}");
+                            backup.messages.push(message);
                         }
                     }
                 }
@@ -1289,6 +1318,167 @@ fn import_response(transport: &Transport, id: u64) -> Result<Value, String> {
         }
     }
     Err("Codex history request timed out; no partial import was applied".into())
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderInfo {
+    pub models: Vec<String>,
+    pub usage: String,
+    pub status: String,
+}
+
+/// Explicit account/model refresh. This is blocking: call it from a UI worker.
+/// No prompt, inference, login, or history request is sent.
+pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<ProviderInfo, String> {
+    if executable.trim().is_empty() || executable.contains(['\0', '\n', '\r']) {
+        return Err("Choose an installed official CLI executable first".into());
+    }
+    if !Path::new(&cwd).is_dir() {
+        return Err("Choose an existing project folder first".into());
+    }
+    match provider {
+        Provider::Codex => {
+            let mut transport = Transport::spawn(&executable, &cwd, &["app-server".into()])?;
+            transport.send(initialization())?;
+            import_response(&transport, 0)?;
+            transport.send(json!({"method":"initialized","params":{}}))?;
+            transport.send(rpc("account/read", 1, json!({"refreshToken":false})))?;
+            let account = import_response(&transport, 1)?;
+            if account["account"]["type"] != "chatgpt" {
+                return Err("Sign in to the official Codex CLI with ChatGPT. API-key and external-token modes are not used".into());
+            }
+            let plan = account["account"]["planType"]
+                .as_str()
+                .unwrap_or("connected");
+            let status = format!("ChatGPT subscription connected ({})", redact(plan));
+            transport.send(rpc("model/list", 2, json!({"limit":100})))?;
+            let models = import_response(&transport, 2)
+                .map(|v| model_names(&v))
+                .unwrap_or_default();
+            transport.send(rpc("account/rateLimits/read", 3, json!({})))?;
+            let usage = import_response(&transport, 3)
+                .map(|v| rate_usage(&v))
+                .unwrap_or_else(|_| {
+                    "Subscription limits are unavailable from this CLI/account".into()
+                });
+            transport.close();
+            Ok(ProviderInfo {
+                models,
+                usage,
+                status,
+            })
+        }
+        Provider::Claude => {
+            let config = RunConfig {
+                provider,
+                executable,
+                cwd,
+                model: String::new(),
+                remote_id: None,
+                prompt: String::new(),
+            };
+            let (_sender, receiver) = mpsc::sync_channel(1);
+            claude_auth(&config, &AtomicBool::new(false), &receiver)?;
+            let mut transport =
+                Transport::spawn(&config.executable, &config.cwd, &claude_args(&config))?;
+            transport.send(claude_control(
+                "spark-probe",
+                json!({"subtype":"initialize","hooks":null}),
+            ))?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut models = Vec::new();
+            while Instant::now() < deadline {
+                let value = match transport.next() {
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                if value["type"] == "control_response"
+                    && value["response"]["request_id"] == "spark-probe"
+                {
+                    if value["response"]["subtype"] == "success" {
+                        models = value["response"]["response"]["models"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| {
+                                        v["value"].as_str().or_else(|| v["id"].as_str())
+                                    })
+                                    .filter(|s| s.len() <= 256)
+                                    .take(100)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                    break;
+                }
+                if value["type"] == "control_request" {
+                    transport.send(json!({"type":"control_response","response":{"subtype":"error",
+                        "request_id":value["request_id"],"error":"Read-only account refresh cannot approve actions"}}))?;
+                }
+            }
+            transport.close();
+            Ok(ProviderInfo {
+                models,
+                usage: "Claude CLI does not expose subscription quota percentages here".into(),
+                status: "Claude subscription connected".into(),
+            })
+        }
+    }
+}
+
+fn login_arguments(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Codex => &["login"],
+        Provider::Claude => &["auth", "login"],
+    }
+}
+
+/// Opens the official CLI's own login flow after an explicit user click.
+/// Success means the console/terminal was launched, not that sign-in completed.
+/// No credentials are supplied, inspected, copied, or saved by Spark Code.
+pub fn launch_login(provider: Provider, executable: String) -> Result<(), String> {
+    if executable.trim().is_empty()
+        || executable.starts_with('-')
+        || executable.contains(['\0', '\n', '\r'])
+    {
+        return Err("Choose an installed official CLI executable first".into());
+    }
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = cli_command(&executable)?;
+        command
+            .args(login_arguments(provider))
+            .creation_flags(0x00000010); // CREATE_NEW_CONSOLE
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("x-terminal-emulator");
+        command
+            .arg("-e")
+            .arg(&executable)
+            .args(login_arguments(provider));
+        command
+    };
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        command.env_remove(key);
+    }
+    // Deliberately do not retain/kill this child: the separate console belongs to
+    // the user, who completes and closes their own official login flow.
+    command.spawn().map_err(|_| "Could not open a login console. Run `codex login` or `claude auth login` in your terminal, then refresh accounts".to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1413,6 +1603,7 @@ mod tests {
         let program = r#"#!/usr/bin/env python3
 import json, sys, os
 MODE = '__MODE__'
+open('mock.pid','w').write(str(os.getpid()))
 def out(value):
     data = json.dumps(value) + '\n'
     # Split writes to prove framing is independent of read boundaries.
@@ -1623,9 +1814,18 @@ for line in sys.stdin:
     fn explicit_import_reads_history_without_resuming_or_inference() {
         let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, exe) = mock_cli("normal");
-        let backup = import_codex(exe, dir.path().to_string_lossy().into_owned()).unwrap();
+        let backup = import_codex(exe.clone(), dir.path().to_string_lossy().into_owned()).unwrap();
         assert_eq!(backup.sessions.len(), 1);
         assert_eq!(backup.messages.len(), 2);
+        let again = import_codex(exe, dir.path().join(".").to_string_lossy().into_owned()).unwrap();
+        assert_eq!(backup.projects[0].id, again.projects[0].id);
+        assert_eq!(backup.sessions[0].id, again.sessions[0].id);
+        assert_eq!(backup.messages[0].id, again.messages[0].id);
+        let mut store = crate::store::Store::open(Path::new(":memory:")).unwrap();
+        let selected = vec![backup.sessions[0].id.clone()];
+        assert_eq!(store.import(&backup, &selected).unwrap(), 1);
+        assert_eq!(store.import(&again, &selected).unwrap(), 0);
+        assert_eq!(store.backup().unwrap().messages.len(), 2);
         let wire = std::fs::read_to_string(dir.path().join("wire.log")).unwrap();
         assert!(wire.contains("thread/list"));
         assert!(wire.contains("thread/read"));
@@ -1662,5 +1862,69 @@ for line in sys.stdin:
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(dir.path().join("interrupted").exists());
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_probes_never_send_prompts_or_history_requests() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        for provider in [Provider::Codex, Provider::Claude] {
+            let (dir, exe) = mock_cli("normal");
+            let info = probe(provider, exe, dir.path().to_string_lossy().into_owned()).unwrap();
+            assert!(!info.models.is_empty());
+            assert!(info.status.contains("connected"));
+            let wire = std::fs::read_to_string(dir.path().join("wire.log")).unwrap();
+            assert!(!wire.contains("thread/list"));
+            assert!(!wire.contains("thread/read"));
+            assert!(!wire.contains("thread/start"));
+            assert!(!wire.contains("turn/start"));
+            assert!(!wire.contains("\"type\": \"user\""));
+        }
+    }
+
+    #[test]
+    fn login_uses_only_official_subscription_login_arguments() {
+        assert_eq!(login_arguments(Provider::Codex), &["login"]);
+        assert_eq!(login_arguments(Provider::Claude), &["auth", "login"]);
+        // Input validation only: this test never spawns a login process.
+        assert!(launch_login(Provider::Claude, "\n".into()).is_err());
+        assert!(launch_login(Provider::Codex, "--api-key".into()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_active_handle_reaps_only_its_child_before_returning() {
+        let _guard = MOCK_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let (first_dir, first_exe) = mock_cli("cancel-stuck");
+        let (second_dir, second_exe) = mock_cli("normal");
+        let first = start(mock_config(Provider::Codex, &first_dir, first_exe)).unwrap();
+        let second = start(mock_config(Provider::Codex, &second_dir, second_exe)).unwrap();
+        loop {
+            if matches!(
+                first.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ProviderEvent::Text(_)
+            ) {
+                break;
+            }
+        }
+        let pid = std::fs::read_to_string(first_dir.path().join("mock.pid")).unwrap();
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        let started = Instant::now();
+        drop(first);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child must be reaped before Drop returns"
+        );
+        let events = until_done(&second, true);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Error(_)))
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_dir.path().join("decision")).unwrap(),
+            "accept"
+        );
     }
 }

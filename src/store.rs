@@ -1,6 +1,10 @@
 use crate::model::*;
-use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 pub struct Store {
     db: Connection,
 }
@@ -19,6 +23,8 @@ impl Store {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
         let db = Connection::open(path).map_err(|e| e.to_string())?;
+        db.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA cache_size=-1024; CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,title TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,remote_id TEXT,updated INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),role TEXT NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS message_session ON messages(session_id,created); CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL);").map_err(|e|e.to_string())?;
         Ok(Self { db })
     }
@@ -144,19 +150,86 @@ impl Store {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
     }
+    /// Persist the local turn before starting a provider, all-or-nothing.
+    pub fn save_turn(&mut self, session: &Session, message: &Message) -> Result<(), String> {
+        if message.session_id != session.id || message.text.len() > MAX_MESSAGE_BYTES {
+            return Err("Invalid turn or message exceeds limit".into());
+        }
+        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE sessions SET title=?2,updated=?3 WHERE id=?1",
+            params![session.id, session.title, session.updated],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO messages VALUES(?1,?2,?3,?4,?5)",
+            params![
+                message.id,
+                message.session_id,
+                message.role,
+                message.text,
+                message.created
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn import(&mut self, b: &Backup, selected: &[String]) -> Result<usize, String> {
+        // An empty preview selection is an actual no-op, including project rows.
+        if selected.is_empty() {
+            return Ok(0);
+        }
+        crate::import::validate(b)?;
+        let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
+        let sessions: Vec<_> = b
+            .sessions
+            .iter()
+            .filter(|s| selected.contains(s.id.as_str()))
+            .collect();
+        if sessions.len() != selected.len() {
+            return Err("Selection contains a conversation missing from the preview".into());
+        }
+        let project_ids: HashSet<&str> = sessions.iter().map(|s| s.project_id.as_str()).collect();
         let tx = self.db.transaction().map_err(|e| e.to_string())?;
         let mut n = 0;
-        for p in &b.projects {
+        for p in b
+            .projects
+            .iter()
+            .filter(|p| project_ids.contains(p.id.as_str()))
+        {
+            let existing: Option<String> = tx
+                .query_row("SELECT path FROM projects WHERE id=?1", [&p.id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if existing.as_ref().is_some_and(|path| path != &p.path) {
+                return Err("Import project ID conflicts with a different local project; nothing was imported".into());
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO projects VALUES(?1,?2,?3)",
                 params![p.id, p.name, p.path],
             )
             .map_err(|e| e.to_string())?;
         }
-        for s in &b.sessions {
-            if !selected.contains(&s.id) {
-                continue;
+        for s in sessions {
+            let provider = serde_json::to_string(&s.provider).map_err(|e| e.to_string())?;
+            let existing: Option<(String, String, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT project_id,provider,model,remote_id FROM sessions WHERE id=?1",
+                    [&s.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if existing.as_ref().is_some_and(|(p, pr, m, r)| {
+                p != &s.project_id || pr != &provider || m != &s.model || r != &s.remote_id
+            }) {
+                return Err(
+                    "Import conversation ID conflicts with local history; nothing was imported"
+                        .into(),
+                );
             }
             n += tx
                 .execute(
@@ -165,23 +238,40 @@ impl Store {
                         s.id,
                         s.project_id,
                         s.title,
-                        serde_json::to_string(&s.provider).unwrap(),
+                        provider,
                         s.model,
                         s.remote_id,
                         s.updated
                     ],
                 )
                 .map_err(|e| e.to_string())?;
-            for m in b.messages.iter().filter(|m| m.session_id == s.id) {
-                if m.text.len() > MAX_MESSAGE_BYTES {
-                    return Err("Imported message exceeds limit".into());
-                }
-                tx.execute(
-                    "INSERT OR IGNORE INTO messages VALUES(?1,?2,?3,?4,?5)",
-                    params![m.id, m.session_id, m.role, m.text, m.created],
+        }
+        for m in b
+            .messages
+            .iter()
+            .filter(|m| selected.contains(m.session_id.as_str()))
+        {
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT session_id,role,text FROM messages WHERE id=?1",
+                    [&m.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .optional()
                 .map_err(|e| e.to_string())?;
+            if existing
+                .as_ref()
+                .is_some_and(|(s, r, t)| s != &m.session_id || r != &m.role || t != &m.text)
+            {
+                return Err(
+                    "Import message ID conflicts with local history; nothing was imported".into(),
+                );
             }
+            tx.execute(
+                "INSERT OR IGNORE INTO messages VALUES(?1,?2,?3,?4,?5)",
+                params![m.id, m.session_id, m.role, m.text, m.created],
+            )
+            .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(n)
@@ -216,5 +306,94 @@ mod tests {
         }
         assert_eq!(s.messages(&c.id).unwrap().len(), 100);
         assert_eq!(s.backup().unwrap().messages.len(), 130);
+    }
+    fn backup_fixture() -> Backup {
+        let projects = (0..2)
+            .map(|n| Project {
+                id: format!("p{n}"),
+                name: format!("Project {n}"),
+                path: format!("/project{n}"),
+            })
+            .collect();
+        let sessions: Vec<_> = (0..2)
+            .map(|n| {
+                let mut s = Session::new(format!("p{n}"), Provider::Codex, "".into());
+                s.id = format!("s{n}");
+                s
+            })
+            .collect();
+        let messages = sessions
+            .iter()
+            .map(|s| Message::new(&s.id, "user", "hello".into()))
+            .collect();
+        Backup {
+            format: "spark-code".into(),
+            version: 1,
+            projects,
+            sessions,
+            messages,
+        }
+    }
+    #[test]
+    fn import_writes_only_selected_projects_and_is_idempotent() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let b = backup_fixture();
+        assert_eq!(store.import(&b, &[]).unwrap(), 0);
+        assert!(store.projects().unwrap().is_empty());
+        assert_eq!(store.import(&b, &["s1".into()]).unwrap(), 1);
+        assert_eq!(store.projects().unwrap().len(), 1);
+        assert_eq!(store.projects().unwrap()[0].id, "p1");
+        assert_eq!(store.import(&b, &["s1".into(), "s1".into()]).unwrap(), 0);
+        assert_eq!(store.backup().unwrap().messages.len(), 1);
+    }
+    #[test]
+    fn conflicting_message_ids_rollback_all_import_writes() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let mut b = backup_fixture();
+        store.import(&b, &["s0".into()]).unwrap();
+        b.messages[0].text = "conflict".into();
+        assert!(
+            store
+                .import(&b, &["s0".into(), "s1".into()])
+                .unwrap_err()
+                .contains("conflicts")
+        );
+        let saved = store.backup().unwrap();
+        assert_eq!(saved.projects.len(), 1);
+        assert_eq!(saved.sessions.len(), 1);
+        assert_eq!(saved.messages[0].text, "hello");
+    }
+    #[test]
+    fn import_rejects_duplicate_ids_and_unknown_selection_without_writes() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let mut b = backup_fixture();
+        assert!(store.import(&b, &["missing".into()]).is_err());
+        b.messages.push(b.messages[0].clone());
+        assert!(
+            store
+                .import(&b, &["s0".into()])
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(store.projects().unwrap().is_empty());
+    }
+    #[test]
+    fn concurrent_frontends_wait_for_short_write_locks() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("data.db");
+        let first = Store::open(&p).unwrap();
+        let second = Store::open(&p).unwrap();
+        first.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let thread = std::thread::spawn(move || {
+            second.save_project(&Project {
+                id: "p".into(),
+                name: "Project".into(),
+                path: "/tmp".into(),
+            })
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        first.db.execute_batch("COMMIT").unwrap();
+        thread.join().unwrap().unwrap();
+        assert_eq!(first.projects().unwrap().len(), 1);
     }
 }
