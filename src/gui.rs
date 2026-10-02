@@ -1,7 +1,8 @@
 use iced::{
     Color, Element, Length, Subscription, Task, Theme,
     widget::{
-        Space, button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+        Space, button, checkbox, column, container, pick_list, row, scrollable, text, text_editor,
+        text_input,
     },
 };
 use spark_code::{engine::Engine, import, model::*, provider};
@@ -33,6 +34,8 @@ struct App {
     project: Option<String>,
     messages: Vec<Message>,
     prompt: String,
+    editor: text_editor::Content,
+    probe_receiver: Option<mpsc::Receiver<Result<provider::ProviderInfo, String>>>,
     search: String,
     settings: bool,
     importing: bool,
@@ -45,7 +48,10 @@ struct App {
 #[derive(Debug, Clone)]
 enum Msg {
     Tick,
-    Prompt(String),
+    Edit(text_editor::Action),
+    Probe(Provider),
+    Login(Provider),
+    UseHistory,
     Search(String),
     Select(String),
     Project(String),
@@ -87,6 +93,8 @@ impl App {
             project,
             messages: Vec::new(),
             prompt: String::new(),
+            editor: text_editor::Content::new(),
+            probe_receiver: None,
             search: String::new(),
             settings: false,
             importing: false,
@@ -98,11 +106,32 @@ impl App {
         }
     }
     fn subscription(&self) -> Subscription<Msg> {
-        if self.engine.as_ref().is_ok_and(|e| !e.jobs.is_empty()) || self.receiver.is_some() {
+        let timer = if self.engine.as_ref().is_ok_and(|e| !e.jobs.is_empty())
+            || self.receiver.is_some()
+            || self.probe_receiver.is_some()
+        {
             iced::time::every(Duration::from_millis(80)).map(|_| Msg::Tick)
         } else {
             Subscription::none()
-        }
+        };
+        Subscription::batch([
+            timer,
+            iced::event::listen_with(|event, _status, _window| {
+                let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) = event
+                else {
+                    return None;
+                };
+                if modifiers.control()
+                    && key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+                {
+                    Some(Msg::Send)
+                } else {
+                    None
+                }
+            }),
+        ])
     }
     fn load(&mut self) {
         if let (Ok(e), Some(id)) = (&self.engine, &self.selected) {
@@ -123,6 +152,18 @@ impl App {
         let result: Result<(), String> = (|| {
             match msg {
                 Msg::Tick => {
+                    if let Some(rx) = &self.probe_receiver {
+                        if let Ok(result) = rx.try_recv() {
+                            self.probe_receiver = None;
+                            match result {
+                                Ok(info) => {
+                                    self.notice = format!("{} · {}", info.status, info.usage);
+                                    e.models = info.models;
+                                }
+                                Err(err) => self.notice = err,
+                            }
+                        }
+                    }
                     if e.poll() {
                         self.messages = self
                             .selected
@@ -144,7 +185,62 @@ impl App {
                         }
                     }
                 }
-                Msg::Prompt(s) => self.prompt = s,
+                Msg::Edit(action) => {
+                    self.editor.perform(action);
+                    self.prompt = self.editor.text();
+                }
+                Msg::Probe(p) => {
+                    if self.probe_receiver.is_none() {
+                        let exe = match p {
+                            Provider::Codex => e.settings.codex_path.clone(),
+                            Provider::Claude => e.settings.claude_path.clone(),
+                        };
+                        let cwd = self
+                            .project
+                            .as_ref()
+                            .and_then(|id| e.projects.iter().find(|p| &p.id == id))
+                            .map(|p| p.path.clone())
+                            .unwrap_or_else(|| ".".into());
+                        let (tx, rx) = mpsc::channel();
+                        self.probe_receiver = Some(rx);
+                        self.notice = "Checking official CLI connection…".into();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(provider::probe(p, exe, cwd));
+                        });
+                    }
+                }
+                Msg::Login(p) => {
+                    let exe = match p {
+                        Provider::Codex => e.settings.codex_path.clone(),
+                        Provider::Claude => e.settings.claude_path.clone(),
+                    };
+                    provider::launch_login(p, exe)?;
+                    self.notice="Complete sign-in in the official CLI window, then click Refresh. No account history is imported.".into();
+                }
+                Msg::UseHistory => {
+                    let mut context =
+                        String::from("Selected imported conversation context (reference only):\n");
+                    for m in self
+                        .messages
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
+                        let remaining = 16000usize.saturating_sub(context.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        let part: String = m.text.chars().take(remaining / 4).collect();
+                        context.push_str(&format!("\n{}: {}\n", m.role, part));
+                    }
+                    context.push_str("\nMy request:\n");
+                    self.prompt = context;
+                    self.editor = text_editor::Content::with_text(&self.prompt);
+                    self.notice="Recent imported text added to your draft. Review it before sending to the selected provider.".into();
+                }
                 Msg::Search(s) => {
                     self.search = s;
                     e.refresh(&self.search)?;
@@ -153,7 +249,11 @@ impl App {
                     self.selected = Some(id);
                     self.settings = false;
                 }
-                Msg::Project(id) => self.project = Some(id),
+                Msg::Project(id) => {
+                    self.project = Some(id);
+                    self.selected = None;
+                    self.messages.clear();
+                }
                 Msg::AddProject => {
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("Choose a project folder")
@@ -167,6 +267,7 @@ impl App {
                     self.selected = Some(e.new_session(p)?);
                     self.settings = false;
                     self.prompt.clear();
+                    self.editor = text_editor::Content::new();
                 }
                 Msg::Send => {
                     if self.selected.is_none() {
@@ -177,12 +278,22 @@ impl App {
                     let id = self.selected.clone().unwrap();
                     e.send(&id, self.prompt.clone())?;
                     self.prompt.clear();
+                    self.editor = text_editor::Content::new();
                 }
                 Msg::Settings => self.settings = !self.settings,
                 Msg::Provider(p) => {
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|id| e.jobs.contains_key(id))
+                    {
+                        return Err("Stop this turn before switching provider".into());
+                    }
                     e.settings.provider = p;
                     e.settings.model.clear();
                     self.model.clear();
+                    e.models.clear();
+                    e.store.save_settings(&e.settings)?;
                     if let Some(id) = &self.selected {
                         if e.jobs.contains_key(id) {
                             return Err("Stop this turn before switching provider".into());
@@ -198,6 +309,7 @@ impl App {
                 Msg::Model(s) => {
                     self.model = s.clone();
                     e.settings.model = s.clone();
+                    e.store.save_settings(&e.settings)?;
                     if let Some(id) = &self.selected {
                         if let Some(ses) = e.sessions.iter_mut().find(|s| &s.id == id) {
                             ses.model = s;
@@ -527,12 +639,26 @@ impl App {
             .selected
             .as_ref()
             .is_some_and(|id| e.jobs.contains_key(id));
+        if ses.is_some_and(|s| s.id.starts_with("t3:") && s.remote_id.is_none()) {
+            content = content.push(
+                button("Use recent imported text in draft")
+                    .style(button::secondary)
+                    .on_press(Msg::UseHistory),
+            );
+        }
         content = content
             .push(scrollable(transcript).height(Length::Fill))
             .push(
                 row![
                     pick_list(Provider::ALL, Some(provider), Msg::Provider).padding(8),
-                    text_input("Model (blank = provider default)", &self.model)
+                    pick_list(
+                        e.models.as_slice(),
+                        e.models.iter().find(|m| *m == &self.model),
+                        Msg::Model
+                    )
+                    .placeholder("Available models")
+                    .padding(8),
+                    text_input("Model or default", &self.model)
                         .on_input(Msg::Model)
                         .padding(9)
                 ]
@@ -540,10 +666,11 @@ impl App {
             )
             .push(
                 row![
-                    text_input("What would you like to build?", &self.prompt)
-                        .on_input(Msg::Prompt)
-                        .on_submit(Msg::Send)
-                        .padding(17),
+                    text_editor(&self.editor)
+                        .placeholder("What would you like to build?  (Ctrl+Enter to send)")
+                        .on_action(Msg::Edit)
+                        .height(100)
+                        .padding(12),
                     button(if running { "Working…" } else { "Send ↑" })
                         .on_press_maybe((!running).then_some(Msg::Send))
                         .padding(17)
@@ -562,7 +689,7 @@ impl App {
     }
     fn settings_view(&self) -> Element<'_, Msg> {
         let e = self.engine.as_ref().unwrap();
-        scrollable(column![text("Settings").size(30),text("Your tools. Your accounts. Your machine.").size(14),Space::new().height(12),text("Provider connections").size(20),text("Install the official native CLI and sign in through its own login flow. spark-code does not store passwords, tokens or API keys. Existing subscription access is checked before a prompt is sent.").size(13),row![text("Codex executable").width(150),text_input("codex",&e.settings.codex_path).on_input(Msg::CodexPath).padding(10)].spacing(8),row![text("Claude executable").width(150),text_input("claude",&e.settings.claude_path).on_input(Msg::ClaudePath).padding(10)].spacing(8),row![button("Codex setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Codex)),button("Claude setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Claude))].spacing(10),text("In a terminal, run: codex login  ·  claude auth login\nNative .exe paths are supported on Windows. Shell scripts and .cmd wrappers are rejected for safe argument handling.").size(12),button("Save connection settings").on_press(Msg::SaveSettings).padding(12),Space::new().height(15),text("Agent capacity").size(20),row![text("Concurrent agents (1–4)").width(220),text_input("2",&e.concurrency.to_string()).on_input(Msg::Concurrency).padding(8).width(80)].spacing(10),text("More agents means more memory and subscription usage. One active agent per project folder prevents colliding edits.").size(12),Space::new().height(15),text("Import & export").size(20),text("Nothing is imported automatically. Preview and choose conversations before adding them. T3 imports preserve transcript text and project paths; they start fresh provider sessions. Codex imports use its official history API for the selected project.").size(13),row![button("Choose backup file…").on_press_maybe((!self.importing).then_some(Msg::ImportFile)).padding(11),button("Preview Codex history").on_press_maybe((!self.importing).then_some(Msg::ImportCodex)).style(button::secondary).padding(11)].spacing(10),button("Export spark-code history…").style(button::secondary).on_press(Msg::Export).padding(11),text(if self.importing{"Reading selected history…"}else{&self.notice}).size(12),Space::new().height(10),text("Privacy & limits").size(20),text("Local transcripts are unencrypted in your Windows user profile. Exported backups include messages and paths. Back them up privately. Claude Code on native Windows does not provide an OS-level sandbox; review tool requests carefully. spark-code is independent of OpenAI and Anthropic.").size(12)].spacing(14)).into()
+        scrollable(column![text("Settings").size(30),text("Your tools. Your accounts. Your machine.").size(14),Space::new().height(12),text("Provider connections").size(20),text("Install the official native CLI and sign in through its own login flow. spark-code does not store passwords, tokens or API keys. Existing subscription access is checked before a prompt is sent.").size(13),row![text("Codex executable").width(150),text_input("codex",&e.settings.codex_path).on_input(Msg::CodexPath).padding(10)].spacing(8),row![text("Claude executable").width(150),text_input("claude",&e.settings.claude_path).on_input(Msg::ClaudePath).padding(10)].spacing(8),row![button("Codex setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Codex)),button("Claude setup guide").style(button::secondary).on_press(Msg::OpenDocs(Provider::Claude))].spacing(10),text("In a terminal, run: codex login  ·  claude auth login\nNative .exe paths are supported on Windows. Shell scripts and .cmd wrappers are rejected for safe argument handling.").size(12),button("Save connection settings").on_press(Msg::SaveSettings).padding(12),row![button("Sign in to Codex").on_press(Msg::Login(Provider::Codex)),button("Refresh Codex").style(button::secondary).on_press_maybe(self.probe_receiver.is_none().then_some(Msg::Probe(Provider::Codex)))].spacing(10),row![button("Sign in to Claude").on_press(Msg::Login(Provider::Claude)),button("Refresh Claude").style(button::secondary).on_press_maybe(self.probe_receiver.is_none().then_some(Msg::Probe(Provider::Claude)))].spacing(10),Space::new().height(15),text("Agent capacity").size(20),row![text("Concurrent agents (1–4)").width(220),text_input("2",&e.concurrency.to_string()).on_input(Msg::Concurrency).padding(8).width(80)].spacing(10),text("More agents means more memory and subscription usage. One active agent per project folder prevents colliding edits.").size(12),Space::new().height(15),text("Import & export").size(20),text("Nothing is imported automatically. Preview and choose conversations before adding them. T3 imports preserve transcript text and project paths; they start fresh provider sessions. Codex imports use its official history API for the selected project.").size(13),row![button("Choose backup file…").on_press_maybe((!self.importing).then_some(Msg::ImportFile)).padding(11),button("Preview Codex history").on_press_maybe((!self.importing).then_some(Msg::ImportCodex)).style(button::secondary).padding(11)].spacing(10),button("Export spark-code history…").style(button::secondary).on_press(Msg::Export).padding(11),text(if self.importing{"Reading selected history…"}else{&self.notice}).size(12),Space::new().height(10),text("Privacy & limits").size(20),text("Local transcripts are unencrypted in your Windows user profile. Exported backups include messages and paths. Back them up privately. Claude Code on native Windows does not provide an OS-level sandbox; review tool requests carefully. spark-code is independent of OpenAI and Anthropic.").size(12)].spacing(14)).into()
     }
     fn import_view(&self) -> Element<'_, Msg> {
         let b = self.preview.as_ref().unwrap();

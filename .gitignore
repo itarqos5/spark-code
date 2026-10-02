@@ -5,3 +5,6 @@
 *.db-shm
 .env
 *.log
+
+__pycache__/
+*.pyc

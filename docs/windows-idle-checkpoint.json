@@ -1,0 +1,157 @@
+{
+  "os": "Microsoft Windows NT 10.0.20348.0",
+  "measuredAtUtc": "2026-10-02T16:03:38.4497762Z",
+  "scenario": "No-account GUI launch and idle; no provider task started",
+  "cliHelpPassed": true,
+  "guiOpened": true,
+  "guiClosedCleanly": true,
+  "samples": [
+    {
+      "elapsedSeconds": 2,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 3,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 4,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 5,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 6,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 7,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 8,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 9,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 10,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 11,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 12,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 13,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 14,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 15,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    },
+    {
+      "elapsedSeconds": 16,
+      "pid": 5400,
+      "workingSetBytes": 23777280,
+      "privateBytes": 8974336,
+      "cpuSeconds": 0.0625,
+      "mainWindowPresent": true,
+      "children": []
+    }
+  ],
+  "tuiMemory": "Not measured: an interactive terminal host is required",
+  "windows10Compatibility": "Not established by a Windows Server or Windows 11 runner",
+  "workingSetBytes": {
+    "average": 23777280.0,
+    "minimum": 23777280.0,
+    "maximum": 23777280.0
+  },
+  "privateBytes": {
+    "average": 8974336.0,
+    "minimum": 8974336.0,
+    "maximum": 8974336.0
+  }
+}

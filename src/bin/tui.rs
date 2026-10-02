@@ -4,8 +4,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
-use spark_code::{engine::Engine, import, model::*};
-use std::{io, path::Path, time::Duration};
+use spark_code::{engine::Engine, import, model::*, provider};
+use std::{io, path::Path, sync::mpsc, time::Duration};
 #[derive(PartialEq)]
 enum Mode {
     Chat,
@@ -30,6 +30,7 @@ struct Tui {
     notice: String,
     preview: Option<Backup>,
     selected: Vec<String>,
+    probe_receiver: Option<mpsc::Receiver<Result<provider::ProviderInfo, String>>>,
 }
 fn main() {
     if let Err(e) = run() {
@@ -42,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("--help" | "-h") => {
             println!(
-                "spark-code 0.1.0\n\nUsage: spark-code [gui | doctor | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
+                "spark-code 0.1.0\n\nUsage: spark-code [gui | doctor | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nF7 official login · F8 refresh account/models\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
                 spark_code::store::data_dir().display()
             );
             return Ok(());
@@ -90,8 +91,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         notice: String::new(),
         preview: None,
         selected: vec![],
+        probe_receiver: None,
     };
     enable_raw_mode()?;
+    let _restore = TerminalRestore;
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let result = loop {
@@ -113,6 +116,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        if let Some(rx) = &app.probe_receiver {
+            if let Ok(result) = rx.try_recv() {
+                app.probe_receiver = None;
+                match result {
+                    Ok(info) => {
+                        app.engine.models = info.models;
+                        app.notice = format!("{} · {}", info.status, info.usage);
+                    }
+                    Err(e) => app.notice = e,
+                }
+            }
+        }
         if app.engine.poll() {
             reload(&mut app);
         }
@@ -121,6 +136,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+struct TerminalRestore;
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
 }
 fn reload(a: &mut Tui) {
     a.messages =
@@ -179,6 +201,38 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
             a.index = 0;
             return Ok(());
         }
+        KeyCode::F(7) => {
+            let p = a.engine.settings.provider;
+            let exe = match p {
+                Provider::Codex => a.engine.settings.codex_path.clone(),
+                Provider::Claude => a.engine.settings.claude_path.clone(),
+            };
+            provider::launch_login(p, exe)?;
+            a.notice = "Finish official login, then F8 Refresh".into();
+            return Ok(());
+        }
+        KeyCode::F(8) => {
+            if a.probe_receiver.is_none() {
+                let p = a.engine.settings.provider;
+                let exe = match p {
+                    Provider::Codex => a.engine.settings.codex_path.clone(),
+                    Provider::Claude => a.engine.settings.claude_path.clone(),
+                };
+                let cwd = a
+                    .project
+                    .as_ref()
+                    .and_then(|id| a.engine.projects.iter().find(|p| &p.id == id))
+                    .map(|p| p.path.clone())
+                    .unwrap_or_else(|| ".".into());
+                let (tx, rx) = mpsc::channel();
+                a.probe_receiver = Some(rx);
+                a.notice = "Refreshing official CLI status…".into();
+                std::thread::spawn(move || {
+                    let _ = tx.send(provider::probe(p, exe, cwd));
+                });
+            }
+            return Ok(());
+        }
         _ => {}
     }
     if let Some(id) = a.id.clone() {
@@ -204,6 +258,7 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
         Mode::Projects => a.engine.projects.len() + 1,
         Mode::Sessions => a.engine.sessions.len(),
         Mode::Providers => 2,
+        Mode::Model => a.engine.models.len(),
         Mode::Settings => 3,
         Mode::ImportReview => a.preview.as_ref().map(|b| b.sessions.len()).unwrap_or(0),
         _ => 0,
@@ -212,10 +267,16 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
         match k.code {
             KeyCode::Up => {
                 a.index = a.index.saturating_sub(1);
+                if a.mode == Mode::Model {
+                    a.input = a.engine.models[a.index].clone();
+                }
                 return Ok(());
             }
             KeyCode::Down => {
                 a.index = (a.index + 1).min(limit - 1);
+                if a.mode == Mode::Model {
+                    a.input = a.engine.models[a.index].clone();
+                }
                 return Ok(());
             }
             _ => {}
@@ -526,6 +587,8 @@ fn draw(f: &mut Frame, a: &Tui) {
             Mode::Help => vec![
                 "F2 Sessions  •  F3 Projects  •  F4 Provider  •  F5 Model".into(),
                 "F6 Settings & import  •  Ctrl+N New conversation".into(),
+                "F7 Official login  •  F8 Refresh account/models".into(),
+                "F5 Model: type a name, or arrows choose refreshed models".into(),
                 "Enter Send  •  Esc Stop current agent / close dialog".into(),
                 "y Allow once / n Deny when approval is visible".into(),
                 "Ctrl+Q Quit  •  spark-code gui opens the desktop app".into(),
