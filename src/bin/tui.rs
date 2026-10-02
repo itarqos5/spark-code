@@ -30,7 +30,7 @@ struct Tui {
     notice: String,
     preview: Option<Backup>,
     selected: Vec<String>,
-    probe_receiver: Option<mpsc::Receiver<Result<provider::ProviderInfo, String>>>,
+    probe_receiver: Option<mpsc::Receiver<(Provider, Result<provider::ProviderInfo, String>)>>,
 }
 fn main() {
     if let Err(e) = run() {
@@ -117,11 +117,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(rx) = &app.probe_receiver {
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((source_provider, result)) = rx.try_recv() {
                 app.probe_receiver = None;
                 match result {
                     Ok(info) => {
-                        app.engine.models = info.models;
+                        app.engine.models.set(source_provider, info.models);
                         app.notice = format!("{} · {}", info.status, info.usage);
                     }
                     Err(e) => app.notice = e,
@@ -228,7 +228,7 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
                 a.probe_receiver = Some(rx);
                 a.notice = "Refreshing official CLI status…".into();
                 std::thread::spawn(move || {
-                    let _ = tx.send(provider::probe(p, exe, cwd));
+                    let _ = tx.send((p, provider::probe(p, exe, cwd)));
                 });
             }
             return Ok(());
@@ -254,11 +254,16 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
             }
         }
     }
+    let selected_provider =
+        a.id.as_ref()
+            .and_then(|id| a.engine.sessions.iter().find(|s| &s.id == id))
+            .map(|s| s.provider)
+            .unwrap_or(a.engine.settings.provider);
     let limit = match a.mode {
         Mode::Projects => a.engine.projects.len() + 1,
         Mode::Sessions => a.engine.sessions.len(),
         Mode::Providers => 2,
-        Mode::Model => a.engine.models.len(),
+        Mode::Model => a.engine.models.get(selected_provider).len(),
         Mode::Settings => 3,
         Mode::ImportReview => a.preview.as_ref().map(|b| b.sessions.len()).unwrap_or(0),
         _ => 0,
@@ -268,14 +273,14 @@ fn key(a: &mut Tui, k: event::KeyEvent) -> Result<(), String> {
             KeyCode::Up => {
                 a.index = a.index.saturating_sub(1);
                 if a.mode == Mode::Model {
-                    a.input = a.engine.models[a.index].clone();
+                    a.input = a.engine.models.get(selected_provider)[a.index].clone();
                 }
                 return Ok(());
             }
             KeyCode::Down => {
                 a.index = (a.index + 1).min(limit - 1);
                 if a.mode == Mode::Model {
-                    a.input = a.engine.models[a.index].clone();
+                    a.input = a.engine.models.get(selected_provider)[a.index].clone();
                 }
                 return Ok(());
             }

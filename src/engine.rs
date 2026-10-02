@@ -1,5 +1,6 @@
 use crate::{
     model::*,
+    model_catalog::ModelCatalog,
     provider::{self, Handle, ProviderCommand, ProviderEvent, RunConfig},
     store::{Store, data_dir},
 };
@@ -20,6 +21,7 @@ pub struct ActiveRun {
     pub usage: String,
     failed: bool,
     canonical_path: PathBuf,
+    provider: Provider,
     // Fields drop in declaration order: provider Handle cleanup must finish first.
     _project_lock: File,
 }
@@ -31,7 +33,7 @@ pub struct Engine {
     pub jobs: HashMap<String, ActiveRun>,
     pub notice: String,
     pub concurrency: usize,
-    pub models: Vec<String>,
+    pub models: ModelCatalog,
     lock_dir: PathBuf,
 }
 impl Engine {
@@ -51,7 +53,7 @@ impl Engine {
             jobs: HashMap::new(),
             notice: "Ready · providers start only when you send".into(),
             concurrency: 2,
-            models: Vec::new(),
+            models: ModelCatalog::default(),
             lock_dir: path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -160,6 +162,7 @@ impl Engine {
             .iter_mut()
             .find(|local| local.id == id)
             .unwrap() = s;
+        let run_provider = config.provider;
         let handle = provider::start(config)?;
         self.jobs.insert(
             id.into(),
@@ -171,6 +174,7 @@ impl Engine {
                 usage: String::new(),
                 failed: false,
                 canonical_path: canonical,
+                provider: run_provider,
                 _project_lock: project_lock,
             },
         );
@@ -263,7 +267,7 @@ impl Engine {
                                 }
                             }
                             ProviderEvent::Usage(t) => j.usage = t,
-                            ProviderEvent::Models(models) => self.models = models,
+                            ProviderEvent::Models(models) => self.models.set(j.provider, models),
                             ProviderEvent::Done => {
                                 done.push(id.clone());
                                 break;

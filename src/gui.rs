@@ -35,7 +35,7 @@ struct App {
     messages: Vec<Message>,
     prompt: String,
     editor: text_editor::Content,
-    probe_receiver: Option<mpsc::Receiver<Result<provider::ProviderInfo, String>>>,
+    probe_receiver: Option<mpsc::Receiver<(Provider, Result<provider::ProviderInfo, String>)>>,
     search: String,
     settings: bool,
     importing: bool,
@@ -153,12 +153,12 @@ impl App {
             match msg {
                 Msg::Tick => {
                     if let Some(rx) = &self.probe_receiver {
-                        if let Ok(result) = rx.try_recv() {
+                        if let Ok((source_provider, result)) = rx.try_recv() {
                             self.probe_receiver = None;
                             match result {
                                 Ok(info) => {
                                     self.notice = format!("{} · {}", info.status, info.usage);
-                                    e.models = info.models;
+                                    e.models.set(source_provider, info.models);
                                 }
                                 Err(err) => self.notice = err,
                             }
@@ -205,7 +205,7 @@ impl App {
                         self.probe_receiver = Some(rx);
                         self.notice = "Checking official CLI connection…".into();
                         std::thread::spawn(move || {
-                            let _ = tx.send(provider::probe(p, exe, cwd));
+                            let _ = tx.send((p, provider::probe(p, exe, cwd)));
                         });
                     }
                 }
@@ -292,7 +292,6 @@ impl App {
                     e.settings.provider = p;
                     e.settings.model.clear();
                     self.model.clear();
-                    e.models.clear();
                     e.store.save_settings(&e.settings)?;
                     if let Some(id) = &self.selected {
                         if e.jobs.contains_key(id) {
@@ -652,8 +651,8 @@ impl App {
                 row![
                     pick_list(Provider::ALL, Some(provider), Msg::Provider).padding(8),
                     pick_list(
-                        e.models.as_slice(),
-                        e.models.iter().find(|m| *m == &self.model),
+                        e.models.get(provider),
+                        e.models.get(provider).iter().find(|m| *m == &self.model),
                         Msg::Model
                     )
                     .placeholder("Available models")
