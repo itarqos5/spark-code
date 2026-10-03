@@ -43,7 +43,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("--help" | "-h") => {
             println!(
-                "spark-code 1.1.0\n\nUsage: spark-code [gui | doctor | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nF7 official login · F8 refresh account/models\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
+                "spark-code {}\n\nUsage: spark-code [gui | doctor | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nF7 official login · F8 refresh account/models\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
+                env!("CARGO_PKG_VERSION"),
                 spark_code::store::data_dir().display()
             );
             return Ok(());
@@ -61,7 +62,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("doctor") => {
             let e = Engine::open()?;
             println!(
-                "spark-code 1.1.0\nData: {}\nCodex executable: {}\nClaude executable: {}\nNo account/history discovery was run.\nUse official CLI login, then send a prompt to verify subscription access.",
+                "spark-code {}\nData: {}\nCodex executable: {}\nClaude executable: {}\nNo account/history discovery was run.\nUse official CLI login, then send a prompt to verify subscription access.",
+                env!("CARGO_PKG_VERSION"),
                 spark_code::store::data_dir().display(),
                 e.settings.codex_path,
                 e.settings.claude_path

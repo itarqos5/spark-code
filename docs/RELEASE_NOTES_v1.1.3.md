@@ -50,7 +50,7 @@ Readiness/model gating, subscription checks, access confirmation, tool approval/
 
 ## Release and validation
 
-The package, CLI/resource checks, smoke tests, and publication workflow target 1.1.3. Both packagers include the replacement DM Sans license. Publication requires successful Windows and Linux builds/tests for the release commit, native launch/chrome checks, and verified package checksums. The release verifier also covers 1.1.3 explicitly.
+The package, CLI/resource checks, smoke tests, and publication workflow target 1.1.3. Terminal help and diagnostics now report Cargo's package version automatically. Both packagers include the replacement DM Sans license. Publication requires successful Windows and Linux builds/tests for the release commit, native launch/chrome checks, and verified package checksums. The release verifier also covers 1.1.3 explicitly.
 
 `packaging/capture-desktop.ps1` adds repeatable native screenshots and short idle samples against isolated synthetic history, covering both themes, all settings tabs, conversation content, and the minimum window size. Design and product records are included in `DESIGN.md`, `.impeccable/design.json`, and `PRODUCT.md`.
 
