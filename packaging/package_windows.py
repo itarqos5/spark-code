@@ -216,9 +216,9 @@ def main():
         shutil.copy2(repository / "docs" / "INSTALL.md", payload / "INSTALL.md")
         shutil.copy2(repository / "docs" / "FEATURES.md", payload / "FEATURES.md")
         shutil.copy2(repository / "docs" / "BRANDING.md", payload / "BRANDING.md")
-        font_license = payload / "licenses" / "inter"
+        font_license = payload / "licenses" / "dm-sans"
         font_license.mkdir(parents=True)
-        shutil.copy2(repository / "assets" / "fonts" / "OFL.txt", font_license / "OFL.txt")
+        shutil.copy2(repository / "assets" / "fonts" / "DMSans-OFL.txt", font_license / "OFL.txt")
         release_notes = repository / "docs" / f"RELEASE_NOTES_v{version}.md"
         if release_notes.is_file():
             shutil.copy2(release_notes, payload / "RELEASE_NOTES.md")

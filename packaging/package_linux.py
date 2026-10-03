@@ -54,9 +54,9 @@ def main():
         ):
             shutil.copy2(source, payload / name)
         dependency_notices(args.cargo_metadata, payload)
-        inter_license = payload / "licenses" / "inter" / "OFL.txt"
-        inter_license.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(repository / "assets" / "fonts" / "OFL.txt", inter_license)
+        font_license = payload / "licenses" / "dm-sans" / "OFL.txt"
+        font_license.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repository / "assets" / "fonts" / "DMSans-OFL.txt", font_license)
         manifest = {
             'application': 'spark-code', 'version': version, 'architecture': 'x86_64',
             'target_platform': 'Linux x86-64; built and smoke-tested on Ubuntu 24.04 (glibc 2.39)',

@@ -355,7 +355,7 @@ impl Transport {
             }
             thread::sleep(POLL);
         }
-        let _ = self.child.kill();
+        kill_process(&mut self.child);
         let _ = self.child.wait();
     }
 }
@@ -363,22 +363,70 @@ impl Drop for Transport {
     fn drop(&mut self) {
         self.outgoing.take();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            kill_process(&mut self.child);
         }
         let _ = self.child.wait();
     }
 }
 
+/// How a configured CLI path is launched. Windows installs commonly expose the official
+/// CLIs as npm `.cmd`/`.ps1` shims next to (or instead of) a native `.exe`.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Launcher {
+    Native,
+    Batch,
+    PowerShell,
+}
+#[cfg(any(windows, test))]
+fn launcher_for(path: &str) -> Result<Launcher, String> {
+    let lower = path.to_ascii_lowercase();
+    let script = is_batch_path(path)
+        || [".cmd", ".bat", ".ps1"]
+            .iter()
+            .any(|ext| lower.contains(ext));
+    // Windows ignores trailing dots/spaces and resolves `name.cmd:stream`, so these
+    // spellings would slip past an extension check. Only plain script paths are accepted.
+    let trimmed = lower.trim_end_matches(['.', ' ']);
+    let suspicious = trimmed.len() != lower.len()
+        || path.char_indices().any(|(i, c)| c == ':' && i != 1)
+        || path.contains(['\0', '\n', '\r', '"', '%']);
+    if script && suspicious {
+        return Err("Unsupported CLI path. Select the plain .exe, .cmd or .ps1 file".into());
+    }
+    Ok(if trimmed.ends_with(".cmd") || trimmed.ends_with(".bat") {
+        Launcher::Batch
+    } else if trimmed.ends_with(".ps1") {
+        Launcher::PowerShell
+    } else {
+        Launcher::Native
+    })
+}
+
 fn cli_command(executable: &str) -> Result<Command, String> {
     #[cfg(windows)]
     {
-        // Native binaries avoid cmd.exe reparsing user values. Prefer .exe even
-        // when an npm batch shim appears earlier in PATH. No shell command strings.
-        if is_batch_path(executable) {
-            return Err("Windows batch shims are unsafe for runtime arguments. Select the official native .exe instead".into());
+        match launcher_for(executable)? {
+            // std quotes batch-file arguments for cmd.exe and refuses ones it cannot make
+            // safe, so no shell command string is ever built here.
+            Launcher::Batch => return Ok(Command::new(executable)),
+            Launcher::PowerShell => {
+                let mut command = Command::new("powershell.exe");
+                command
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                    ])
+                    .arg(executable);
+                return Ok(command);
+            }
+            Launcher::Native => {}
         }
-        let path = Path::new(executable);
-        if path.extension().is_none() {
+        if Path::new(executable).extension().is_none() {
             return Ok(Command::new(format!("{executable}.exe")));
         }
     }
@@ -390,6 +438,23 @@ fn is_batch_path(path: &str) -> bool {
         let p = p.trim_end_matches(['.', ' ']).to_ascii_lowercase();
         p.ends_with(".cmd") || p.ends_with(".bat")
     })
+}
+
+/// Stops one child we spawned plus the processes it started. npm shims run the real CLI as
+/// a grandchild, so killing only the shim would leave the CLI running.
+fn kill_process(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
@@ -984,7 +1049,7 @@ struct AuthChild(Child);
 impl Drop for AuthChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
+            kill_process(&mut self.0);
         }
         let _ = self.0.wait();
     }
@@ -1569,6 +1634,7 @@ fn import_response(transport: &Transport, id: u64) -> Result<Value, String> {
 
 #[derive(Clone, Debug)]
 pub struct ProviderInfo {
+    pub version: String,
     pub models: Vec<String>,
     pub usage: String,
     pub status: String,
@@ -1579,9 +1645,180 @@ pub struct ProviderInfo {
     pub tool_free_supported: bool,
 }
 
+fn login_arguments(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Codex => &["login"],
+        Provider::Claude => &["auth", "login"],
+    }
+}
+
+/// Opens the official CLI's own login flow after an explicit user click.
+/// Success means the console/terminal was launched, not that sign-in completed.
+/// No credentials are supplied, inspected, copied, or saved by Spark Code.
+pub fn launch_login(provider: Provider, executable: String) -> Result<(), String> {
+    if executable.trim().is_empty()
+        || executable.starts_with('-')
+        || executable.contains(['\0', '\n', '\r'])
+    {
+        return Err("Choose an installed official CLI executable first".into());
+    }
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = cli_command(&executable)?;
+        command
+            .args(login_arguments(provider))
+            .creation_flags(0x00000010); // CREATE_NEW_CONSOLE
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("x-terminal-emulator");
+        command
+            .arg("-e")
+            .arg(&executable)
+            .args(login_arguments(provider));
+        command
+    };
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        command.env_remove(key);
+    }
+    // Deliberately do not retain/kill this child: the separate console belongs to
+    // the user, who completes and closes their own official login flow.
+    command.spawn().map_err(|_| "Could not open a login console. Run `codex login` or `claude auth login` in your terminal, then refresh accounts".to_string())?;
+    Ok(())
+}
+
+/// Finds the official CLI on PATH (`where` on Windows, `which` elsewhere) and returns the
+/// best full path: a native binary first, then `.cmd`/`.bat`, then `.ps1` shims.
+pub fn detect_cli(provider: Provider) -> Option<String> {
+    let name = provider.cli();
+    let mut found: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    let queries = [name.to_owned(), format!("{name}.ps1")];
+    #[cfg(not(windows))]
+    let queries = [name.to_owned()];
+    for query in queries {
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new("where.exe");
+            command.creation_flags(0x08000000);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = Command::new("which");
+        let Ok(output) = command
+            .arg(&query)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        found.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty() && Path::new(line).is_file()),
+        );
+    }
+    #[cfg(windows)]
+    if provider == Provider::Codex {
+        // npm exposes shell shims on PATH. Prefer the official native binary
+        // shipped alongside that installation to avoid an extra shell per turn.
+        let native: Vec<String> = found
+            .iter()
+            .filter_map(|shim| bundled_codex_binary(Path::new(shim)))
+            .collect();
+        found.extend(native);
+    }
+    let rank = |path: &str| match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("exe") => Some(0),
+        Some("cmd") | Some("bat") => Some(1),
+        Some("ps1") => Some(2),
+        // Extensionless files are POSIX scripts/binaries on Unix; npm's extensionless
+        // Windows shim is a sh script that cannot be launched natively.
+        None if cfg!(not(windows)) => Some(0),
+        _ => None,
+    };
+    found
+        .into_iter()
+        .filter_map(|path| rank(&path).map(|r| (r, path)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, path)| path)
+}
+
+#[cfg(any(windows, test))]
+fn bundled_codex_binary(shim: &Path) -> Option<String> {
+    let root = shim.parent()?;
+    let paths = [
+        "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+        "node_modules/@openai/codex/vendor/x86_64-pc-windows-msvc/codex/codex.exe",
+    ];
+    paths
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Explicit account/model refresh. This is blocking: call it from a UI worker.
 /// No prompt, inference, login, or history request is sent.
 pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<ProviderInfo, String> {
+    let mut info = probe_account(provider, executable.clone(), cwd)?;
+    info.version = cli_version(&executable);
+    Ok(info)
+}
+
+/// Best-effort `--version` of the selected CLI, reduced to its version number.
+fn cli_version(executable: &str) -> String {
+    let Ok(mut command) = cli_command(executable) else {
+        return String::new();
+    };
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let Ok(output) = command.output() else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|word| truncate(word, 32))
+        .unwrap_or_default()
+}
+
+fn probe_account(
+    provider: Provider,
+    executable: String,
+    cwd: String,
+) -> Result<ProviderInfo, String> {
     if executable.trim().is_empty() || executable.contains(['\0', '\n', '\r']) {
         return Err("Choose an installed official CLI executable first".into());
     }
@@ -1626,6 +1863,7 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
             });
             transport.close();
             Ok(ProviderInfo {
+                version: String::new(),
                 models,
                 usage,
                 status,
@@ -1699,6 +1937,7 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
                 return Err("Claude CLI could not verify the required safe stream protocol. Update the official CLI and refresh".into());
             }
             Ok(ProviderInfo {
+                version: String::new(),
                 models,
                 usage: "Subscription quota and reset unavailable from the official Claude CLI stream; token counts are not quota percentages".into(),
                 status: "Claude subscription connected".into(),
@@ -1710,59 +1949,6 @@ pub fn probe(provider: Provider, executable: String, cwd: String) -> Result<Prov
             })
         }
     }
-}
-
-fn login_arguments(provider: Provider) -> &'static [&'static str] {
-    match provider {
-        Provider::Codex => &["login"],
-        Provider::Claude => &["auth", "login"],
-    }
-}
-
-/// Opens the official CLI's own login flow after an explicit user click.
-/// Success means the console/terminal was launched, not that sign-in completed.
-/// No credentials are supplied, inspected, copied, or saved by Spark Code.
-pub fn launch_login(provider: Provider, executable: String) -> Result<(), String> {
-    if executable.trim().is_empty()
-        || executable.starts_with('-')
-        || executable.contains(['\0', '\n', '\r'])
-    {
-        return Err("Choose an installed official CLI executable first".into());
-    }
-    #[cfg(windows)]
-    let mut command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = cli_command(&executable)?;
-        command
-            .args(login_arguments(provider))
-            .creation_flags(0x00000010); // CREATE_NEW_CONSOLE
-        command
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut command = Command::new("x-terminal-emulator");
-        command
-            .arg("-e")
-            .arg(&executable)
-            .args(login_arguments(provider));
-        command
-    };
-    for key in [
-        "OPENAI_API_KEY",
-        "CODEX_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-    ] {
-        command.env_remove(key);
-    }
-    // Deliberately do not retain/kill this child: the separate console belongs to
-    // the user, who completes and closes their own official login flow.
-    command.spawn().map_err(|_| "Could not open a login console. Run `codex login` or `claude auth login` in your terminal, then refresh accounts".to_string())?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1838,17 +2024,40 @@ mod tests {
         assert!(!args.contains(&c.prompt));
     }
     #[test]
-    fn windows_batch_variants_rejected() {
+    fn windows_script_variants_are_classified_safely() {
         for p in [
-            "claude.cmd",
             "C:\\bin\\claude.CMD. ",
             "a.cmd:stream",
             "C:\\x.bat\\...\\..",
+            "C:\\x.ps1 ",
+            "C:\\x.cmd\"&calc",
         ] {
-            assert!(is_batch_path(p), "{p}");
+            assert!(launcher_for(p).is_err(), "{p}");
         }
-        assert!(!is_batch_path("C:\\bin\\claude.exe"));
+        assert_eq!(launcher_for("C:\\bin\\claude.cmd"), Ok(Launcher::Batch));
+        assert_eq!(launcher_for("C:\\bin\\codex.PS1"), Ok(Launcher::PowerShell));
+        assert_eq!(launcher_for("C:\\bin\\claude.exe"), Ok(Launcher::Native));
+        assert_eq!(launcher_for("claude"), Ok(Launcher::Native));
     }
+    #[test]
+    fn login_uses_only_official_subscription_login_arguments() {
+        assert_eq!(login_arguments(Provider::Codex), &["login"]);
+        assert_eq!(login_arguments(Provider::Claude), &["auth", "login"]);
+        // Input validation only: this test never spawns a login process.
+        assert!(launch_login(Provider::Claude, "\n".into()).is_err());
+        assert!(launch_login(Provider::Codex, "--api-key".into()).is_err());
+    }
+    #[test]
+    fn npm_codex_detection_finds_its_native_binary_without_reading_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("codex.cmd");
+        assert!(bundled_codex_binary(&shim).is_none());
+        let binary = dir.path().join("node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, []).unwrap();
+        assert_eq!(bundled_codex_binary(&shim).as_deref(), binary.to_str());
+    }
+
     #[test]
     fn secrets_are_not_in_diagnostics() {
         let raw = json!({"accessToken":"super-secret","nested":{"password":"dontshow"},"command":"curl -H Bearer sk-ant-abc"});
@@ -2278,15 +2487,6 @@ for line in sys.stdin:
             assert!(!wire.contains("turn/start"));
             assert!(!wire.contains("\"type\": \"user\""));
         }
-    }
-
-    #[test]
-    fn login_uses_only_official_subscription_login_arguments() {
-        assert_eq!(login_arguments(Provider::Codex), &["login"]);
-        assert_eq!(login_arguments(Provider::Claude), &["auth", "login"]);
-        // Input validation only: this test never spawns a login process.
-        assert!(launch_login(Provider::Claude, "\n".into()).is_err());
-        assert!(launch_login(Provider::Codex, "--api-key".into()).is_err());
     }
 
     #[cfg(target_os = "linux")]

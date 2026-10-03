@@ -43,15 +43,18 @@ Package version fields come from Cargo and are not changed by this branding work
 
 ## Typography
 
-`assets/fonts/InterVariable.ttf` is unmodified Inter 4.1, fetched from the official
-[rsms/inter v4.1 source](https://github.com/rsms/inter/blob/v4.1/docs/font-files/InterVariable.ttf).
-Its actual font-family name is **Inter Variable**, with weights 100–900 and an
-optical-size axis. Register the bundled bytes before the native UI renders and use
-that exact family name; do not rely on a locally installed Inter font.
+`assets/fonts/DMSans.ttf` is unmodified DM Sans (variable, `opsz` + `wght` axes) from
+the [google/fonts](https://github.com/google/fonts/tree/main/ofl/dmsans) OFL release;
+the license is `assets/fonts/DMSans-OFL.txt`. Its font-family name is **DM Sans**.
+Register the bundled bytes before the native UI renders and use that exact family
+name; do not rely on a locally installed copy.
+
+Provider marks in `src/icons.rs` use embedded SVG assets from `assets/icons`:
+the OpenAI mark for Codex and the Claude-orange spark for Claude.
 
 The font uses the SIL Open Font License 1.1. The full upstream license is preserved
-in `assets/fonts/OFL.txt` and shipped by the Windows packager under
-`licenses/inter/OFL.txt`. Other distribution formats that embed the font must also
+in `assets/fonts/DMSans-OFL.txt` and shipped by both packagers under
+`licenses/dm-sans/OFL.txt`. Other distribution formats that embed the font must also
 include this license.
 
 SHA-256 of the upstream font:

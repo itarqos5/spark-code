@@ -17,7 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=Path('dist/linux-smoke.json'))
-    parser.add_argument('--expected-version', default='1.1.0')
+    parser.add_argument('--expected-version', default='1.1.3')
     parser.add_argument('--capture', type=Path, help='Optional native PNG screenshot destination')
     args = parser.parse_args()
     if not re.fullmatch(r'\d+\.\d+\.\d+', args.expected_version):

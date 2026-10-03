@@ -49,7 +49,7 @@ class ReleaseVerificationTests(unittest.TestCase):
         (root / 'windows-smoke.json').write_text(json.dumps(dict(cliHelpPassed=True, guiOpened=True, guiClosedCleanly=True)))
         (root / 'linux-smoke.json').write_text(json.dumps(dict(cliHelpPassed=True, guiOpened=True, guiStayedAlive=True, expectedVersion=version)))
 
-        if version == '1.1.0':
+        if tuple(map(int, version.split('.'))) >= (1, 1, 0):
             for platform in ('windows', 'linux'):
                 (root / f'{platform}-build.json').write_text(json.dumps(dict(platform=platform, version=version, commit=commit, cliVersionPassed=True)))
             states = ['restored'] + ['minimized', 'restored', 'maximized', 'restored'] * 2
@@ -66,6 +66,12 @@ class ReleaseVerificationTests(unittest.TestCase):
             root = Path(tmp)
             self.stage(root, '1.1.0')
             verify(root, '1.1.0', 'a' * 40)
+
+    def test_verifies_1_1_3_exact_commit_and_native_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.stage(root, '1.1.3')
+            verify(root, '1.1.3', 'a' * 40)
 
     def test_rejects_wrong_release_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

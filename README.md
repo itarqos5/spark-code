@@ -4,12 +4,14 @@ A lightweight native coding workspace for Windows and Linux, with desktop and te
 
 ## What is new
 
-- Monochrome native desktop with embedded Inter, saved dark/light themes, reduced-motion support, and a custom draggable title bar with native window controls
+- GPU-accelerated native desktop with embedded DM Sans, saved dark/light themes, reduced-motion support, and a custom draggable title bar with native window controls
 - Readable Markdown and code, a focused “What are we building next?” welcome screen, and one Projects add control
 - Model-first selection backed by each official provider’s actual readiness and model catalog
 - Read-only general chat without selecting a project, plus project chat with Workspace approval mode by default
 - Provider-reported Codex reasoning efforts, explicit confirmation for Codex Full access, and retained tool approvals
 - Separate Codex and Claude account/usage displays and a bounded activity timeline; unavailable quota data stays unavailable
+- Seven organized settings tabs with chat appearance, resource controls, keyboard shortcuts, and ChatGPT / Dots access
+- Cached Markdown and icons, debounced search, asynchronous pickers, adjustable streaming updates, and no history reloads while typing
 
 The terminal interface shares the local data store and core provider engine. The new desktop layout and controls are specific to the graphical interface.
 
@@ -21,7 +23,7 @@ Get the **Windows x64 setup**, **Windows x64 portable ZIP**, or **Linux x64 arch
 - **Linux:** extract the archive and run `./spark-code-desktop`; compatible system libraries and X11 or XWayland are required
 - **Terminal:** run `spark-code` for the TUI or `spark-code gui` for the desktop; setup offers optional Windows user-PATH integration
 
-Install the official Codex or Claude Code CLI separately. In Settings, select its executable, launch its own subscription sign-in, then Refresh. Sending stays locked until the selected provider is ready and an available model is selected. Installation, sign-in, history scanning, and imports do not run automatically.
+Install the official Codex or Claude Code CLI separately. Spark Code can find installed CLIs on PATH and check their existing connections at startup. In Settings → Providers, choose an executable if needed, launch its own subscription sign-in, then Refresh. Sending stays locked until the selected provider is ready and an available model is selected. Installation, sign-in, history scanning, and imports do not run automatically. Codex reuses your CLI-managed ChatGPT account; Dots access opens ChatGPT.
 
 ## Boundaries worth knowing
 
@@ -37,4 +39,4 @@ The Windows installer is unsigned. Do not disable security protections to run it
 - [Build and package from source](docs/build-windows.md)
 - [CI builds and native verification](https://github.com/itarqos5/spark-code/actions)
 
-Licensed under MIT. The bundled Inter font includes its SIL Open Font License.
+Licensed under MIT. The bundled DM Sans font includes its SIL Open Font License.

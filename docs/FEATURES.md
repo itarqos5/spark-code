@@ -2,22 +2,27 @@
 
 ## Native desktop and terminal
 
-- Rust desktop built with Iced and the CPU tiny-skia renderer, plus a Ratatui terminal frontend sharing one SQLite store
+- Rust desktop built with Iced and GPU-accelerated wgpu rendering, with tiny-skia fallback when a compatible GPU cannot initialize; a Ratatui terminal frontend shares the SQLite store
 - No Electron, embedded web preview, or bundled browser engine
-- Native desktop typography using embedded Inter; monochrome dark/light themes saved between launches
+- Native desktop typography using embedded DM Sans; neutral dark/light themes saved between launches
 - Short, bounded theme/layout transitions and a saved reduced-motion setting
 - Spark Code bolt branding and Windows display/search metadata; executable names and terminal command remain lowercase `spark-code`
 - Custom draggable desktop title bar with minimize, maximize/restore, and close; resize edges/corners and a native Windows system menu
 - A focused “What are we building next?” welcome screen with one canonical Projects add control
 - Native Markdown/code rendering, multiline composer, response copying, Enter to send, Shift+Enter for a newline, and an IME-composition submission guard
 - Local projects, searchable conversations, JSON export, and explicit imported-context-to-draft actions
+- Seven settings tabs: General, Appearance, Providers, ChatGPT & Dots, Performance, Data & history, and Keyboard shortcuts
+- Saved message text size, compact spacing, timestamps, sidebar/activity visibility, auto-follow scrolling, CLI detection, connection checks, concurrency, transcript limit, stream refresh interval, and antialiasing
+- Actual graphics adapter/backend and process memory diagnostics; idle polling stops automatically
+- Cached Markdown and vector geometry, batched streaming, debounced search, and asynchronous native file/folder pickers; typing and animation ticks do not reload SQLite history
 
 The refreshed layout, theme controls, account panels, and access/effort selectors are desktop features. The terminal interface shares the provider engine and data store; identical interface capabilities are not claimed.
 
 ## Provider readiness and safe scopes
 
 - Codex through the official app-server protocol and Claude Code through the unmodified official CLI
-- Explicit official login launch and account/model refresh; no provider installation or sign-in happens automatically
+- Explicit official login launch; optional startup CLI discovery and account/model checks. No provider installation or sign-in happens automatically
+- Windows npm Codex installations resolve to their bundled native executable when available, avoiding an additional shell per invocation
 - Readiness and model catalogs tracked separately per provider, avoiding cross-provider model-cache reuse
 - Model-first desktop selection: sending requires a ready provider and a model from its reported catalog
 - Read-only general chat without selecting a project, using an app-owned neutral working directory
@@ -40,6 +45,10 @@ Read-only general chat is a provider permission scope, **not OS isolation or a g
 - Up to four bounded concurrent agents, two by default, including different project directories
 
 Spark Code cannot reset provider quotas, guarantee free usage, or infer a remaining quota from token counts. Provider access, limits, features, and charges depend on the account and provider terms.
+
+## ChatGPT and Dots
+
+The Codex connection reuses the installed CLI's ChatGPT-managed authentication; the CLI owns credential storage and refresh. Spark Code does not copy a ChatGPT browser token or another application's credentials. Settings provides official ChatGPT and Dots links. Dots and other ChatGPT-only tools continue to run in ChatGPT; a native Dots API integration is not claimed. See [Codex authentication](https://developers.openai.com/codex/auth) and [Meet dots](https://learn.chatgpt.com/docs/dots).
 
 ## Explicit, previewed imports
 

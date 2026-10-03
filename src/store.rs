@@ -79,7 +79,7 @@ impl Store {
     pub fn messages(&self, id: &str) -> Result<Vec<Message>, String> {
         self.messages_limit(id, VISIBLE_MESSAGES)
     }
-    fn messages_limit(&self, id: &str, limit: usize) -> Result<Vec<Message>, String> {
+    pub fn messages_limit(&self, id: &str, limit: usize) -> Result<Vec<Message>, String> {
         let mut st=self.db.prepare("SELECT id,session_id,role,text,created FROM (SELECT rowid,id,session_id,role,text,created FROM messages WHERE session_id=?1 ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid").map_err(|e|e.to_string())?;
         st.query_map(params![id, limit as i64], |r| {
             Ok(Message {

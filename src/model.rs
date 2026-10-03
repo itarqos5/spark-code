@@ -93,8 +93,43 @@ pub struct Settings {
     pub reduced_motion: bool,
     pub codex_path: String,
     pub claude_path: String,
+    pub codex_enabled: bool,
+    pub claude_enabled: bool,
     pub provider: Provider,
     pub model: String,
+    pub chat_text_size: u32,
+    pub compact_layout: bool,
+    pub show_timestamps: bool,
+    pub auto_scroll: bool,
+    pub sidebar_visible: bool,
+    pub activity_visible: bool,
+    pub auto_detect_cli: bool,
+    pub auto_refresh_providers: bool,
+    pub concurrency: usize,
+    pub visible_messages: usize,
+    pub stream_interval_ms: u64,
+    pub antialiasing: bool,
+}
+impl Settings {
+    /// Clamp persisted preferences before they reach layout, timers, or allocations.
+    pub fn normalize(&mut self) {
+        self.chat_text_size = self.chat_text_size.clamp(13, 19);
+        self.concurrency = self.concurrency.clamp(1, 4);
+        self.visible_messages = self.visible_messages.clamp(20, VISIBLE_MESSAGES);
+        self.stream_interval_ms = self.stream_interval_ms.clamp(16, 200);
+    }
+    pub fn enabled(&self, provider: Provider) -> bool {
+        match provider {
+            Provider::Codex => self.codex_enabled,
+            Provider::Claude => self.claude_enabled,
+        }
+    }
+    pub fn set_enabled(&mut self, provider: Provider, enabled: bool) {
+        match provider {
+            Provider::Codex => self.codex_enabled = enabled,
+            Provider::Claude => self.claude_enabled = enabled,
+        }
+    }
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -103,8 +138,22 @@ impl Default for Settings {
             reduced_motion: false,
             codex_path: "codex".into(),
             claude_path: "claude".into(),
+            codex_enabled: true,
+            claude_enabled: true,
             provider: Provider::Codex,
             model: String::new(),
+            chat_text_size: 15,
+            compact_layout: false,
+            show_timestamps: false,
+            auto_scroll: true,
+            sidebar_visible: true,
+            activity_visible: false,
+            auto_detect_cli: true,
+            auto_refresh_providers: true,
+            concurrency: 2,
+            visible_messages: 50,
+            stream_interval_ms: 33,
+            antialiasing: false,
         }
     }
 }
@@ -138,5 +187,35 @@ mod appearance_tests {
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert!(restored.light_theme && restored.reduced_motion);
+    }
+    #[test]
+    fn invalid_performance_preferences_are_bounded() {
+        let mut settings: Settings = serde_json::from_str(r#"{"chat_text_size":0,"concurrency":999,"visible_messages":999999,"stream_interval_ms":0}"#).unwrap();
+        settings.normalize();
+        assert_eq!(settings.chat_text_size, 13);
+        assert_eq!(settings.concurrency, 4);
+        assert_eq!(settings.visible_messages, VISIBLE_MESSAGES);
+        assert_eq!(settings.stream_interval_ms, 16);
+    }
+    #[test]
+    fn new_preferences_survive_serialization_and_legacy_defaults() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.auto_scroll && legacy.auto_detect_cli && legacy.sidebar_visible);
+        assert_eq!(legacy.visible_messages, 50);
+        let settings = Settings {
+            concurrency: 4,
+            stream_interval_ms: 80,
+            chat_text_size: 17,
+            auto_detect_cli: false,
+            antialiasing: true,
+            ..legacy
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.concurrency, 4);
+        assert_eq!(restored.stream_interval_ms, 80);
+        assert_eq!(restored.chat_text_size, 17);
+        assert!(!restored.auto_detect_cli);
+        assert!(restored.antialiasing);
     }
 }

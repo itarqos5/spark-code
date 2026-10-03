@@ -47,9 +47,12 @@ impl Engine {
     pub fn open() -> Result<Self, String> {
         Self::open_at(&data_dir().join("spark-code.db"))
     }
-    fn open_at(path: &Path) -> Result<Self, String> {
+    /// Open an explicitly selected local workspace database.
+    pub fn open_at(path: &Path) -> Result<Self, String> {
         let store = Store::open(path)?;
-        let settings = store.settings();
+        let mut settings = store.settings();
+        settings.normalize();
+        let concurrency = settings.concurrency;
         let projects = store.projects()?;
         let sessions = store.sessions("")?;
         Ok(Self {
@@ -59,7 +62,7 @@ impl Engine {
             sessions,
             jobs: HashMap::new(),
             notice: "Ready · providers start only when you send".into(),
-            concurrency: 2,
+            concurrency,
             models: ModelCatalog::default(),
             providers: ProviderStates::default(),
             timelines: HashMap::new(),
@@ -120,6 +123,7 @@ impl Engine {
         let state = self.providers.get_mut(provider);
         state.readiness = Readiness::Ready;
         state.status = info.status;
+        state.version = info.version;
         state.usage_windows = info.usage_windows;
         state.usage_note = info.usage;
         state.checked_at = now();

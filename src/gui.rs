@@ -1,7 +1,7 @@
 use crate::appearance::Colors;
 use iced::{
     Color, Element, Length, Subscription, Task, Theme,
-    widget::{Space, container, markdown, text_editor},
+    widget::{Space, container, markdown, operation, text_editor},
 };
 use spark_code::{
     engine::Engine,
@@ -20,20 +20,139 @@ mod ui;
 
 pub fn run() -> iced::Result {
     set_app_id();
-    iced::application(App::new, App::update, App::view)
-        .title("Spark Code")
-        .font(include_bytes!("../assets/fonts/InterVariable.ttf").as_slice())
-        .default_font(iced::Font::with_name("Inter Variable"))
-        .theme(App::theme)
-        .subscription(App::subscription)
-        .window(iced::window::Settings {
-            size: iced::Size::new(1280., 840.),
-            min_size: Some(iced::Size::new(920., 640.)),
-            decorations: false,
-            icon: load_icon(),
-            ..Default::default()
+    let app = App::new();
+    let antialiasing = app.engine.as_ref().is_ok_and(|e| e.settings.antialiasing);
+    let size = app
+        .capture_path
+        .as_ref()
+        .and_then(|_| std::env::var("SPARK_CODE_CAPTURE_SIZE").ok())
+        .and_then(|value| {
+            let (width, height) = value.split_once('x')?;
+            Some(iced::Size::new(
+                width.parse::<f32>().ok()?.clamp(920., 2560.),
+                height.parse::<f32>().ok()?.clamp(640., 1440.),
+            ))
         })
-        .run()
+        .unwrap_or_else(|| iced::Size::new(1280., 840.));
+    let boot = std::cell::RefCell::new(Some(app));
+    iced::application(
+        move || {
+            (
+                boot.borrow_mut().take().unwrap_or_else(App::new),
+                iced::system::information().map(Msg::SystemInfo),
+            )
+        },
+        App::update,
+        App::view,
+    )
+    .title("Spark Code")
+    .font(include_bytes!("../assets/fonts/DMSans.ttf").as_slice())
+    .default_font(iced::Font::with_name("DM Sans"))
+    .antialiasing(antialiasing)
+    .theme(App::theme)
+    .subscription(App::subscription)
+    .window(iced::window::Settings {
+        size,
+        min_size: Some(iced::Size::new(920., 640.)),
+        decorations: false,
+        icon: load_icon(),
+        ..Default::default()
+    })
+    .run()
+}
+#[cfg(test)]
+mod workspace_preferences_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, App, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open_at(&dir.path().join("workspace.db")).unwrap();
+        engine.settings.auto_detect_cli = false;
+        engine.settings.auto_refresh_providers = false;
+        let id = engine.new_general_chat().unwrap();
+        engine
+            .store
+            .save_message(&Message::new(&id, "user", "cached history".into()))
+            .unwrap();
+        let mut app = App::with_engine(Ok(engine));
+        app.selected = Some(id.clone());
+        app.load();
+        app.cache_markdown();
+        (dir, app, id)
+    }
+    #[test]
+    fn typing_and_idle_ticks_use_cached_history_until_a_conversation_is_selected() {
+        let (_dir, mut app, id) = fixture();
+        let message = &app.messages[0];
+        let edited = Message {
+            text: "database changed".into(),
+            ..message.clone()
+        };
+        app.engine
+            .as_ref()
+            .unwrap()
+            .store
+            .save_message(&edited)
+            .unwrap();
+        let _ = app.update(Msg::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        let _ = app.update(Msg::Tick);
+        assert!(app.prompt.starts_with('x'));
+        assert_eq!(app.messages[0].text, "cached history");
+        let _ = app.update(Msg::Select(id));
+        assert_eq!(app.messages[0].text, "database changed");
+    }
+    #[test]
+    fn settings_changes_persist_and_reopen_with_the_same_agent_capacity() {
+        let (dir, mut app, _id) = fixture();
+        let _ = app.update(Msg::Concurrency("4".into()));
+        let _ = app.update(Msg::Preference(Preference::HistoryLimit(20)));
+        let _ = app.update(Msg::Preference(Preference::StreamInterval(80)));
+        let _ = app.update(Msg::Preference(Preference::TextSize(17)));
+        let _ = app.update(Msg::ToggleSidebar);
+        let reopened = Engine::open_at(&dir.path().join("workspace.db")).unwrap();
+        assert_eq!(reopened.concurrency, 4);
+        assert_eq!(reopened.settings.visible_messages, 20);
+        assert_eq!(reopened.settings.stream_interval_ms, 80);
+        assert_eq!(reopened.settings.chat_text_size, 17);
+        assert!(!reopened.settings.sidebar_visible);
+    }
+    #[test]
+    fn switching_provider_clears_the_previous_transcript() {
+        let (_dir, mut app, _id) = fixture();
+        let _ = app.update(Msg::Provider(Provider::Claude));
+        assert!(app.selected.is_none());
+        assert!(app.messages.is_empty());
+        assert!(app.rendered.is_empty());
+    }
+    #[test]
+    fn searching_does_not_remove_the_selected_session_from_the_engine() {
+        let (_dir, mut app, id) = fixture();
+        let _ = app.update(Msg::Search("no matching title".into()));
+        app.search_started = Some(Instant::now() - Duration::from_millis(200));
+        let _ = app.update(Msg::Tick);
+        assert!(app.filtered_sessions.as_ref().unwrap().is_empty());
+        assert!(
+            app.engine
+                .as_ref()
+                .unwrap()
+                .sessions
+                .iter()
+                .any(|s| s.id == id)
+        );
+        assert_eq!(app.messages[0].text, "cached history");
+    }
+    #[test]
+    fn selecting_the_current_provider_preserves_composer_choices() {
+        let (_dir, mut app, _id) = fixture();
+        app.model = "chosen-model".into();
+        app.effort = "high".into();
+        app.access = AccessMode::Full.to_string();
+        let _ = app.update(Msg::Provider(Provider::Codex));
+        assert_eq!(app.model, "chosen-model");
+        assert_eq!(app.effort, "high");
+        assert_eq!(app.access, AccessMode::Full.to_string());
+    }
 }
 fn load_icon() -> Option<iced::window::Icon> {
     let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!(
@@ -66,8 +185,17 @@ struct App {
     prompt: String,
     editor: text_editor::Content,
     probe_receiver: Option<mpsc::Receiver<(Provider, Result<provider::ProviderInfo, String>)>>,
+    probe_pending: usize,
+    detect_receiver: Option<mpsc::Receiver<Vec<(Provider, String)>>>,
+    auto_probe: bool,
+    expanded: Option<Provider>,
     search: String,
+    filtered_sessions: Option<Vec<Session>>,
     settings: bool,
+    settings_tab: SettingsTab,
+    system_info: Option<iced::system::Information>,
+    follow_stream: bool,
+    search_started: Option<Instant>,
     importing: bool,
     preview: Option<Backup>,
     chosen: HashSet<String>,
@@ -94,7 +222,6 @@ struct App {
 #[derive(Debug, Clone)]
 enum Msg {
     Tick,
-    GeneralChat,
     ComposerSubmit,
     ImeUpdate(bool),
     ImeCommit,
@@ -116,8 +243,6 @@ enum Msg {
     OpenLink(String),
     Capture(iced::window::Screenshot),
     Edit(text_editor::Action),
-    Probe(Provider),
-    Login(Provider),
     UseHistory,
     Search(String),
     Select(String),
@@ -130,7 +255,9 @@ enum Msg {
     Model(String),
     CodexPath(String),
     ClaudePath(String),
-    SaveSettings,
+    ProbeAll,
+    ToggleProvider(Provider, bool),
+    ToggleExpand(Provider),
     Cancel(String),
     Approve(String, bool),
     ImportFile,
@@ -140,12 +267,82 @@ enum Msg {
     CloseImport,
     Export,
     Copy(String),
-    OpenDocs(Provider),
     Concurrency(String),
+    SettingsTab(SettingsTab),
+    Preference(Preference),
+    DetectCli,
+    Login(Provider),
+    QuickPrompt(String),
+    JumpToLatest,
+    Scrolled(bool),
+    DismissNotice,
+    SystemInfo(iced::system::Information),
+    RefreshDiagnostics,
+    FolderPicked(Option<String>),
+    BackupPicked(Option<String>),
+    ExportPicked(Option<String>),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    General,
+    Appearance,
+    Providers,
+    ChatGpt,
+    Performance,
+    Data,
+    Shortcuts,
+}
+impl SettingsTab {
+    const ALL: [Self; 7] = [
+        Self::General,
+        Self::Appearance,
+        Self::Providers,
+        Self::ChatGpt,
+        Self::Performance,
+        Self::Data,
+        Self::Shortcuts,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::Providers => "Providers",
+            Self::ChatGpt => "ChatGPT & Dots",
+            Self::Performance => "Performance",
+            Self::Data => "Data & history",
+            Self::Shortcuts => "Keyboard shortcuts",
+        }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Self::General => "Make this workspace yours.",
+            Self::Appearance => "Choose how your conversations look and feel.",
+            Self::Providers => "Connect your coding agents through their official CLIs.",
+            Self::ChatGpt => "Your ChatGPT account, coding tools, and cloud workspace.",
+            Self::Performance => "Keep input responsive and resource use under control.",
+            Self::Data => "Bring your conversations with you and keep a local backup.",
+            Self::Shortcuts => "Move through your workspace without leaving the keyboard.",
+        }
+    }
+}
+#[derive(Clone, Debug)]
+enum Preference {
+    TextSize(u32),
+    Compact(bool),
+    Timestamps(bool),
+    AutoScroll(bool),
+    AutoDetect(bool),
+    AutoRefresh(bool),
+    HistoryLimit(usize),
+    StreamInterval(u64),
+    Antialiasing(bool),
 }
 impl App {
     fn new() -> Self {
-        let engine = Engine::open();
+        Self::with_engine(Engine::open())
+    }
+    fn with_engine(engine: Result<Engine, String>) -> Self {
         let project: Option<String> = None;
         let model = engine
             .as_ref()
@@ -161,7 +358,39 @@ impl App {
             0.
         };
         let capture_path = std::env::var("SPARK_CODE_CAPTURE").ok();
-        Self {
+        // Look for the official CLIs on PATH in the background whenever a configured
+        // path doesn't point at a real file, then check the providers once found.
+        let sidebar_visible = engine
+            .as_ref()
+            .map(|e| e.settings.sidebar_visible)
+            .unwrap_or(true);
+        let show_agents = engine.as_ref().is_ok_and(|e| e.settings.activity_visible);
+        let detect_receiver = engine
+            .as_ref()
+            .ok()
+            .filter(|e| e.settings.auto_detect_cli)
+            .map(|e| {
+                let missing: Vec<Provider> = Provider::ALL
+                    .into_iter()
+                    .filter(|p| {
+                        let path = match p {
+                            Provider::Codex => &e.settings.codex_path,
+                            Provider::Claude => &e.settings.claude_path,
+                        };
+                        !std::path::Path::new(path).is_file()
+                    })
+                    .collect();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let found: Vec<(Provider, String)> = missing
+                        .into_iter()
+                        .filter_map(|p| provider::detect_cli(p).map(|path| (p, path)))
+                        .collect();
+                    let _ = tx.send(found);
+                });
+                rx
+            });
+        let mut app = Self {
             current_provider,
             effort: String::new(),
             access: if project.is_some() {
@@ -173,8 +402,8 @@ impl App {
             full_access_confirmation: false,
             ime_composing: false,
             last_ime_event: None,
-            show_agents: false,
-            sidebar_visible: true,
+            show_agents,
+            sidebar_visible,
             rendered: HashMap::new(),
             theme_mix,
             theme_from: theme_mix,
@@ -190,29 +419,60 @@ impl App {
             prompt: String::new(),
             editor: text_editor::Content::new(),
             probe_receiver: None,
+            probe_pending: 0,
+            detect_receiver,
+            auto_probe: false,
+            expanded: None,
             search: String::new(),
+            filtered_sessions: None,
             settings: false,
+            settings_tab: SettingsTab::General,
+            system_info: None,
+            follow_stream: true,
+            search_started: None,
             importing: false,
             preview: None,
             chosen: HashSet::new(),
             receiver: None,
             notice: String::new(),
             model,
+        };
+        // Capture-only overrides make native visual checks reproducible against an
+        // isolated SPARK_CODE_DATA_DIR. They never send prompts or change history.
+        if app.capture_path.is_some() {
+            if let Ok(tab) = std::env::var("SPARK_CODE_CAPTURE_TAB")
+                && let Some(tab) = SettingsTab::ALL.into_iter().find(|t| t.title() == tab)
+            {
+                app.settings = true;
+                app.settings_tab = tab;
+                app.expanded = Some(Provider::Codex);
+            }
+            if let Ok(id) = std::env::var("SPARK_CODE_CAPTURE_SESSION") {
+                app.selected = Some(id);
+                app.load();
+                app.cache_markdown();
+            }
         }
+        app
     }
     fn subscription(&self) -> Subscription<Msg> {
         let timer = if self.engine.as_ref().is_ok_and(|e| !e.jobs.is_empty())
             || self.receiver.is_some()
             || self.probe_receiver.is_some()
+            || self.detect_receiver.is_some()
             || self.theme_started.is_some()
             || self.motion_started.is_some()
             || self.capture_started.is_some()
+            || self.search_started.is_some()
         {
             iced::time::every(Duration::from_millis(
                 if self.theme_started.is_some() || self.motion_started.is_some() {
                     16
                 } else {
-                    80
+                    self.engine
+                        .as_ref()
+                        .map(|e| e.settings.stream_interval_ms)
+                        .unwrap_or(33)
                 },
             ))
             .map(|_| Msg::Tick)
@@ -250,6 +510,15 @@ impl App {
                     {
                         Some(Msg::Settings)
                     } else if modifiers.control()
+                        && matches!(key.as_ref(), iced::keyboard::Key::Character("b" | "B"))
+                    {
+                        Some(Msg::ToggleSidebar)
+                    } else if modifiers.control()
+                        && modifiers.shift()
+                        && matches!(key.as_ref(), iced::keyboard::Key::Character("a" | "A"))
+                    {
+                        Some(Msg::ToggleAgents)
+                    } else if modifiers.control()
                         && modifiers.shift()
                         && matches!(key.as_ref(), iced::keyboard::Key::Character("t" | "T"))
                     {
@@ -269,7 +538,10 @@ impl App {
     }
     fn load(&mut self) {
         if let (Ok(e), Some(id)) = (&self.engine, &self.selected) {
-            self.messages = e.store.messages(id).unwrap_or_default();
+            match e.store.messages_limit(id, e.settings.visible_messages) {
+                Ok(messages) => self.messages = messages,
+                Err(error) => self.notice = format!("Could not load conversation: {error}"),
+            }
             if let Some(s) = e.sessions.iter().find(|s| &s.id == id) {
                 self.project = (!s.project_id.is_empty()).then(|| s.project_id.clone());
                 self.current_provider = s.provider;
@@ -278,6 +550,13 @@ impl App {
         }
     }
     fn update(&mut self, mut msg: Msg) -> Task<Msg> {
+        if let Msg::SystemInfo(info) = msg {
+            self.system_info = Some(info);
+            return Task::none();
+        }
+        if matches!(msg, Msg::RefreshDiagnostics) {
+            return iced::system::information().map(Msg::SystemInfo);
+        }
         if matches!(msg, Msg::ComposerSubmit) {
             if submission_blocked_by_ime(
                 self.ime_composing,
@@ -307,7 +586,55 @@ impl App {
             return Task::none();
         }
         match &msg {
-            Msg::Copy(s) => return iced::clipboard::write(s.clone()),
+            Msg::AddProject => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose a project folder")
+                            .pick_folder()
+                            .await
+                            .map(|p| p.path().to_string_lossy().into_owned())
+                    },
+                    Msg::FolderPicked,
+                );
+            }
+            Msg::ImportFile => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose a Spark Code export or T3 Code backup")
+                            .add_filter("Supported backups", &["json", "zip", "sqlite", "db"])
+                            .pick_file()
+                            .await
+                            .map(|p| p.path().to_string_lossy().into_owned())
+                    },
+                    Msg::BackupPicked,
+                );
+            }
+            Msg::Export => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Export local Spark Code history")
+                            .set_file_name("spark-code.json")
+                            .save_file()
+                            .await
+                            .map(|p| p.path().to_string_lossy().into_owned())
+                    },
+                    Msg::ExportPicked,
+                );
+            }
+            Msg::Copy(id) => {
+                let message = self.messages.iter().find(|m| &m.id == id).or_else(|| {
+                    self.engine
+                        .as_ref()
+                        .ok()
+                        .and_then(|e| e.jobs.values().map(|j| &j.draft).find(|m| &m.id == id))
+                });
+                return message
+                    .map(|m| iced::clipboard::write(m.text.clone()))
+                    .unwrap_or_else(Task::none);
+            }
             Msg::Resize(direction) => {
                 let direction = *direction;
                 return iced::window::latest()
@@ -341,6 +668,13 @@ impl App {
                     ) {
                         self.notice = format!("Preview capture failed: {err}");
                     }
+                    if let Some(info) = &self.system_info {
+                        let diagnostics = serde_json::json!({ "adapter": info.graphics_adapter, "backend": info.graphics_backend, "memory_bytes": info.memory_used });
+                        let _ = std::fs::write(
+                            format!("{path}.renderer.json"),
+                            diagnostics.to_string(),
+                        );
+                    }
                 }
                 return Task::none();
             }
@@ -364,6 +698,13 @@ impl App {
         {
             self.motion_started = Some(Instant::now());
         }
+        let reload = matches!(
+            msg,
+            Msg::Select(_) | Msg::New | Msg::Send | Msg::Preference(Preference::HistoryLimit(_))
+        );
+        let switched_settings_tab = matches!(msg, Msg::SettingsTab(_));
+        let mut transcript_changed = reload;
+        let mut scroll_to_bottom = matches!(msg, Msg::Send | Msg::Select(_) | Msg::JumpToLatest);
         let Ok(e) = &mut self.engine else {
             return Task::none();
         };
@@ -385,85 +726,99 @@ impl App {
                     {
                         self.motion_started = None;
                     }
-                    if let Some(rx) = &self.probe_receiver {
-                        if let Ok((source_provider, result)) = rx.try_recv() {
+                    if let Some(rx) = &self.detect_receiver
+                        && let Ok(found) = rx.try_recv()
+                    {
+                        self.detect_receiver = None;
+                        for (p, path) in found {
+                            match p {
+                                Provider::Codex => e.settings.codex_path = path,
+                                Provider::Claude => e.settings.claude_path = path,
+                            }
+                            e.providers.get_mut(p).readiness = Readiness::Unchecked;
+                        }
+                        e.store.save_settings(&e.settings)?;
+                        self.auto_probe = e.settings.auto_refresh_providers;
+                    }
+                    if let Some(rx) = &self.probe_receiver
+                        && let Ok((source_provider, result)) = rx.try_recv()
+                    {
+                        self.probe_pending = self.probe_pending.saturating_sub(1);
+                        if self.probe_pending == 0 {
                             self.probe_receiver = None;
-                            match result {
-                                Ok(info) => {
-                                    self.notice = format!("{} · {}", info.status, info.usage);
-                                    let first = info.models.first().cloned();
-                                    e.probe_succeeded(source_provider, info);
-                                    if source_provider == self.current_provider
-                                        && self.model.is_empty()
-                                    {
-                                        if let Some(model) = first {
-                                            self.model = model.clone();
-                                            e.settings.model = model;
-                                            e.store.save_settings(&e.settings)?;
-                                        }
-                                    }
+                        }
+                        match result {
+                            Ok(info) => {
+                                self.notice = format!("{} · {}", info.status, info.usage);
+                                let first = info.models.first().cloned();
+                                e.probe_succeeded(source_provider, info);
+                                if source_provider == self.current_provider
+                                    && self.model.is_empty()
+                                    && let Some(model) = first
+                                {
+                                    self.model = model.clone();
+                                    e.settings.model = model;
+                                    e.store.save_settings(&e.settings)?;
                                 }
-                                Err(err) => {
-                                    e.provider_failed(source_provider, &err);
-                                    self.notice = err;
-                                }
+                            }
+                            Err(err) => {
+                                e.provider_failed(source_provider, &err);
+                                self.notice = err;
                             }
                         }
                     }
-                    if e.poll() {
-                        self.messages = self
-                            .selected
-                            .as_ref()
-                            .map(|id| e.store.messages(id).unwrap_or_default())
-                            .unwrap_or_default();
+                    if self
+                        .search_started
+                        .is_some_and(|at| at.elapsed() >= Duration::from_millis(180))
+                    {
+                        self.search_started = None;
+                        self.filtered_sessions = if self.search.trim().is_empty() {
+                            None
+                        } else {
+                            Some(e.store.sessions(&self.search)?)
+                        };
                     }
-                    if let Some(rx) = &self.receiver {
-                        if let Ok(r) = rx.try_recv() {
-                            self.importing = false;
-                            self.receiver = None;
-                            match r {
-                                Ok(b) => {
-                                    self.chosen = b.sessions.iter().map(|s| s.id.clone()).collect();
-                                    self.preview = Some(b);
-                                }
-                                Err(err) => self.notice = err,
+                    // The database only changes when a selected run completes. Streaming
+                    // deltas stay in the engine and markdown cache; typing never reads SQLite.
+                    let selected_was_running = self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|id| e.jobs.contains_key(id));
+                    if e.poll() {
+                        transcript_changed = true;
+                        scroll_to_bottom =
+                            selected_was_running && self.follow_stream && e.settings.auto_scroll;
+                        if selected_was_running
+                            && self
+                                .selected
+                                .as_ref()
+                                .is_some_and(|id| !e.jobs.contains_key(id))
+                            && let Some(id) = &self.selected
+                        {
+                            self.messages =
+                                e.store.messages_limit(id, e.settings.visible_messages)?;
+                        }
+                    }
+                    if let Some(rx) = &self.receiver
+                        && let Ok(r) = rx.try_recv()
+                    {
+                        self.importing = false;
+                        self.receiver = None;
+                        match r {
+                            Ok(b) => {
+                                self.chosen = b.sessions.iter().map(|s| s.id.clone()).collect();
+                                self.preview = Some(b);
                             }
+                            Err(err) => self.notice = err,
                         }
                     }
                 }
                 Msg::Edit(action) => {
+                    let edited = action.is_edit();
                     self.editor.perform(action);
-                    self.prompt = self.editor.text();
-                }
-                Msg::Probe(p) => {
-                    if self.probe_receiver.is_none() {
-                        let exe = match p {
-                            Provider::Codex => e.settings.codex_path.clone(),
-                            Provider::Claude => e.settings.claude_path.clone(),
-                        };
-                        let cwd = self
-                            .project
-                            .as_ref()
-                            .and_then(|id| e.projects.iter().find(|p| &p.id == id))
-                            .map(|p| p.path.clone())
-                            .unwrap_or_else(|| ".".into());
-                        let (tx, rx) = mpsc::channel();
-                        self.probe_receiver = Some(rx);
-                        e.providers.get_mut(p).readiness = Readiness::Checking;
-                        self.notice = "Checking official CLI connection…".into();
-                        std::thread::spawn(move || {
-                            let _ = tx.send((p, provider::probe(p, exe, cwd)));
-                        });
+                    if edited {
+                        self.prompt = self.editor.text();
                     }
-                }
-                Msg::Login(p) => {
-                    let exe = match p {
-                        Provider::Codex => e.settings.codex_path.clone(),
-                        Provider::Claude => e.settings.claude_path.clone(),
-                    };
-                    provider::launch_login(p, exe)?;
-                    e.providers.get_mut(p).readiness = Readiness::Unchecked;
-                    self.notice="Complete sign-in in the official CLI window, then click Refresh. No account history is imported.".into();
                 }
                 Msg::UseHistory => {
                     let mut context =
@@ -491,7 +846,10 @@ impl App {
                 }
                 Msg::Search(s) => {
                     self.search = s;
-                    e.refresh(&self.search)?;
+                    self.search_started = Some(Instant::now());
+                    if self.search.trim().is_empty() {
+                        self.filtered_sessions = None;
+                    }
                 }
                 Msg::Select(id) => {
                     if let Some(session) = e.sessions.iter().find(|s| s.id == id) {
@@ -502,6 +860,7 @@ impl App {
                     }
                     self.selected = Some(id);
                     self.settings = false;
+                    self.follow_stream = true;
                 }
                 Msg::Project(id) => {
                     self.project = Some(id);
@@ -509,12 +868,9 @@ impl App {
                     self.selected = None;
                     self.messages.clear();
                 }
-                Msg::AddProject => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Choose a project folder")
-                        .pick_folder()
-                    {
-                        self.project = Some(e.add_project(p.to_string_lossy().into_owned())?);
+                Msg::FolderPicked(path) => {
+                    if let Some(path) = path {
+                        self.project = Some(e.add_project(path)?);
                         self.selected = None;
                         self.messages.clear();
                         self.access = AccessMode::Workspace.to_string();
@@ -559,13 +915,6 @@ impl App {
                     self.prompt.clear();
                     self.editor = text_editor::Content::new();
                 }
-                Msg::GeneralChat => {
-                    self.project = None;
-                    self.selected = None;
-                    self.messages.clear();
-                    self.settings = false;
-                    self.access = AccessMode::ReadOnly.to_string();
-                }
                 Msg::ImeUpdate(composing) => {
                     self.ime_composing = composing;
                     self.last_ime_event = Some(Instant::now());
@@ -608,6 +957,31 @@ impl App {
                 }
                 Msg::CancelFullAccess => self.full_access_confirmation = false,
                 Msg::Settings => self.settings = !self.settings,
+                Msg::SettingsTab(tab) => {
+                    self.settings = true;
+                    self.settings_tab = tab;
+                    if tab == SettingsTab::Providers {
+                        self.expanded = Some(self.current_provider);
+                    }
+                }
+                Msg::Preference(preference) => {
+                    match preference {
+                        Preference::TextSize(v) => e.settings.chat_text_size = v,
+                        Preference::Compact(v) => e.settings.compact_layout = v,
+                        Preference::Timestamps(v) => e.settings.show_timestamps = v,
+                        Preference::AutoScroll(v) => {
+                            e.settings.auto_scroll = v;
+                            self.follow_stream = v;
+                        }
+                        Preference::AutoDetect(v) => e.settings.auto_detect_cli = v,
+                        Preference::AutoRefresh(v) => e.settings.auto_refresh_providers = v,
+                        Preference::HistoryLimit(v) => e.settings.visible_messages = v,
+                        Preference::StreamInterval(v) => e.settings.stream_interval_ms = v,
+                        Preference::Antialiasing(v) => e.settings.antialiasing = v,
+                    }
+                    e.settings.normalize();
+                    e.store.save_settings(&e.settings)?;
+                }
                 Msg::ToggleTheme => {
                     e.settings.light_theme = !e.settings.light_theme;
                     self.theme_from = self.theme_mix;
@@ -628,8 +1002,50 @@ impl App {
                         self.theme_mix = self.theme_target;
                     }
                 }
-                Msg::ToggleAgents => self.show_agents = !self.show_agents,
-                Msg::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+                Msg::ToggleAgents => {
+                    self.show_agents = !self.show_agents;
+                    e.settings.activity_visible = self.show_agents;
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::ToggleSidebar => {
+                    self.sidebar_visible = !self.sidebar_visible;
+                    e.settings.sidebar_visible = self.sidebar_visible;
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::DismissNotice => {
+                    self.notice.clear();
+                    e.notice.clear();
+                }
+                Msg::QuickPrompt(value) => {
+                    self.prompt = value;
+                    self.editor = text_editor::Content::with_text(&self.prompt);
+                }
+                Msg::JumpToLatest => self.follow_stream = true,
+                Msg::Scrolled(at_bottom) => self.follow_stream = at_bottom,
+                Msg::Login(p) => {
+                    let exe = match p {
+                        Provider::Codex => e.settings.codex_path.clone(),
+                        Provider::Claude => e.settings.claude_path.clone(),
+                    };
+                    provider::launch_login(p, exe)?;
+                    self.notice =
+                        "Complete sign-in in the official CLI window, then Refresh providers."
+                            .into();
+                }
+                Msg::DetectCli => {
+                    if self.detect_receiver.is_none() {
+                        let (tx, rx) = mpsc::channel();
+                        self.detect_receiver = Some(rx);
+                        std::thread::spawn(move || {
+                            let found = Provider::ALL
+                                .into_iter()
+                                .filter_map(|p| provider::detect_cli(p).map(|path| (p, path)))
+                                .collect();
+                            let _ = tx.send(found);
+                        });
+                        self.notice = "Looking for official CLIs on PATH…".into();
+                    }
+                }
                 Msg::OpenLink(url) => {
                     if url.starts_with("https://") || url.starts_with("http://") {
                         open_url(&url)?;
@@ -638,6 +1054,9 @@ impl App {
                     }
                 }
                 Msg::Provider(p) => {
+                    if p == self.current_provider {
+                        return Ok(());
+                    }
                     if self
                         .selected
                         .as_ref()
@@ -662,11 +1081,13 @@ impl App {
                         if e.jobs.contains_key(id) {
                             return Err("Stop this turn before switching provider".into());
                         }
-                        if let Some(s) = e.sessions.iter_mut().find(|s| &s.id == id) {
-                            if s.provider != p {
-                                self.selected = None;
-                                self.notice="Provider changed. Your next message starts a separate conversation.".into();
-                            }
+                        if let Some(s) = e.sessions.iter_mut().find(|s| &s.id == id)
+                            && s.provider != p
+                        {
+                            self.selected = None;
+                            self.messages.clear();
+                            self.rendered.clear();
+                            self.notice="Provider changed. Your next message starts a separate conversation.".into();
                         }
                     }
                 }
@@ -674,41 +1095,86 @@ impl App {
                     self.model = s.clone();
                     e.settings.model = s.clone();
                     e.store.save_settings(&e.settings)?;
-                    if let Some(id) = &self.selected {
-                        if let Some(ses) = e.sessions.iter_mut().find(|s| &s.id == id) {
-                            ses.model = s;
-                            e.store.save_session(ses)?;
-                        }
+                    if let Some(id) = &self.selected
+                        && let Some(ses) = e.sessions.iter_mut().find(|s| &s.id == id)
+                    {
+                        ses.model = s;
+                        e.store.save_session(ses)?;
                     }
                 }
                 Msg::CodexPath(s) => {
                     e.settings.codex_path = s;
                     e.providers.get_mut(Provider::Codex).readiness = Readiness::Unchecked;
+                    e.store.save_settings(&e.settings)?;
                 }
                 Msg::ClaudePath(s) => {
                     e.settings.claude_path = s;
                     e.providers.get_mut(Provider::Claude).readiness = Readiness::Unchecked;
-                }
-                Msg::SaveSettings => {
                     e.store.save_settings(&e.settings)?;
-                    self.notice="Settings saved. Sign in through the official CLI before your first message.".into();
+                }
+                Msg::ProbeAll => {
+                    let providers: Vec<Provider> = Provider::ALL
+                        .into_iter()
+                        .filter(|p| e.settings.enabled(*p))
+                        .collect();
+                    if self.probe_receiver.is_none() && !providers.is_empty() {
+                        let cwd = self
+                            .project
+                            .as_ref()
+                            .and_then(|id| e.projects.iter().find(|p| &p.id == id))
+                            .map(|p| p.path.clone())
+                            .unwrap_or_else(|| ".".into());
+                        let jobs: Vec<(Provider, String)> = providers
+                            .iter()
+                            .map(|p| {
+                                let exe = match p {
+                                    Provider::Codex => e.settings.codex_path.clone(),
+                                    Provider::Claude => e.settings.claude_path.clone(),
+                                };
+                                (*p, exe)
+                            })
+                            .collect();
+                        for p in &providers {
+                            e.providers.get_mut(*p).readiness = Readiness::Checking;
+                        }
+                        let (tx, rx) = mpsc::channel();
+                        self.probe_receiver = Some(rx);
+                        self.probe_pending = jobs.len();
+                        self.notice = "Checking official CLI connections…".into();
+                        for (p, exe) in jobs {
+                            let tx = tx.clone();
+                            let cwd = cwd.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send((p, provider::probe(p, exe, cwd)));
+                            });
+                        }
+                    }
+                }
+                Msg::ToggleProvider(p, enabled) => {
+                    e.settings.set_enabled(p, enabled);
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::ToggleExpand(p) => {
+                    self.expanded = if self.expanded == Some(p) {
+                        None
+                    } else {
+                        Some(p)
+                    };
                 }
                 Msg::Concurrency(s) => {
                     e.concurrency = s.parse::<usize>().unwrap_or(2).clamp(1, 4);
+                    e.settings.concurrency = e.concurrency;
+                    e.store.save_settings(&e.settings)?;
                 }
                 Msg::Cancel(id) => e.cancel(&id),
                 Msg::Approve(id, a) => e.approve(&id, a),
-                Msg::ImportFile => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Choose a spark-code export or consistent T3 Code backup")
-                        .add_filter("Supported backups", &["json", "zip", "sqlite", "db"])
-                        .pick_file()
-                    {
+                Msg::BackupPicked(path) => {
+                    if let Some(path) = path {
                         let (tx, rx) = mpsc::channel();
                         self.receiver = Some(rx);
                         self.importing = true;
                         std::thread::spawn(move || {
-                            let _ = tx.send(import::preview(&p));
+                            let _ = tx.send(import::preview(std::path::Path::new(&path)));
                         });
                     }
                 }
@@ -742,7 +1208,10 @@ impl App {
                         self.notice = format!(
                             "Imported {n} conversations. Source files were left unchanged."
                         );
-                        e.refresh(&self.search)?;
+                        e.refresh("")?;
+                        if !self.search.trim().is_empty() {
+                            self.filtered_sessions = Some(e.store.sessions(&self.search)?);
+                        }
                         self.preview = None;
                     }
                 }
@@ -750,22 +1219,11 @@ impl App {
                     self.preview = None;
                     self.chosen.clear();
                 }
-                Msg::Export => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Export local spark-code history")
-                        .set_file_name("spark-code.json")
-                        .save_file()
-                    {
-                        import::export(&p, &e.store.backup()?)?;
+                Msg::ExportPicked(path) => {
+                    if let Some(path) = path {
+                        import::export(std::path::Path::new(&path), &e.store.backup()?)?;
                         self.notice="Export saved. It contains local messages and project paths, but no stored account credentials.".into();
                     }
-                }
-                Msg::OpenDocs(p) => {
-                    let url = match p {
-                        Provider::Codex => "https://developers.openai.com/codex/cli/",
-                        Provider::Claude => "https://code.claude.com/docs/en/setup",
-                    };
-                    open_url(url)?;
                 }
                 Msg::Copy(_)
                 | Msg::DragWindow
@@ -777,14 +1235,32 @@ impl App {
                 | Msg::SystemMenu
                 | Msg::RequestCapture
                 | Msg::ComposerSubmit => {}
+                Msg::SystemInfo(_) | Msg::RefreshDiagnostics => {}
+                Msg::AddProject | Msg::ImportFile | Msg::Export => {}
             }
             Ok(())
         })();
         if let Err(err) = result {
             self.notice = err;
         }
-        self.load();
-        self.cache_markdown();
+        if reload {
+            self.load();
+        }
+        if transcript_changed {
+            self.cache_markdown();
+        }
+        if std::mem::take(&mut self.auto_probe) {
+            return Task::done(Msg::ProbeAll);
+        }
+        if switched_settings_tab {
+            return operation::snap_to(
+                "settings-content",
+                iced::widget::scrollable::RelativeOffset::START,
+            );
+        }
+        if scroll_to_bottom && !self.settings && !self.messages.is_empty() {
+            return operation::snap_to("transcript", iced::widget::scrollable::RelativeOffset::END);
+        }
         Task::none()
     }
     fn view(&self) -> Element<'_, Msg> {
@@ -803,12 +1279,15 @@ impl App {
     fn provider_ready(&self, p: Provider) -> bool {
         self.engine
             .as_ref()
-            .is_ok_and(|e| e.providers.get(p).ready())
+            .is_ok_and(|e| e.settings.enabled(p) && e.providers.get(p).ready())
     }
     fn provider_hint(&self, p: Provider) -> String {
         let Ok(e) = &self.engine else {
             return "Local storage unavailable".into();
         };
+        if !e.settings.enabled(p) {
+            return format!("{} is disabled in Settings.", provider_title(p));
+        }
         let state = e.providers.get(p);
         match state.readiness{Readiness::Ready=>"Connected with your subscription".into(),Readiness::Checking=>"Checking the official CLI connection…".into(),Readiness::Unchecked=>"Open Settings and Refresh this provider. Install its official CLI or sign in if needed.".into(),_=>format!("{} Open Settings to install, sign in, or troubleshoot, then Refresh.",state.status)}
     }
@@ -1010,6 +1489,21 @@ fn parse_access(value: &str) -> Option<AccessMode> {
     ]
     .into_iter()
     .find(|m| m.to_string() == value)
+}
+fn provider_title(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Codex => "Codex",
+        Provider::Claude => "Claude",
+    }
+}
+fn ago_label(timestamp: i64) -> String {
+    let secs = spark_code::model::now().saturating_sub(timestamp).max(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
 }
 fn reset_label(timestamp: i64) -> String {
     let left = timestamp.saturating_sub(now());

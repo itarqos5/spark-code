@@ -52,6 +52,7 @@ pub struct UsageWindow {
 pub struct ProviderSnapshot {
     pub readiness: Readiness,
     pub status: String,
+    pub version: String,
     pub usage_windows: Vec<UsageWindow>,
     pub usage_note: String,
     pub checked_at: i64,

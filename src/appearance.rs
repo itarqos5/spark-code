@@ -1,5 +1,5 @@
 use iced::{
-    Background, Border, Color, Shadow, Theme, Vector,
+    Background, Border, Color, Theme,
     widget::{button, container, pick_list, text_editor, text_input},
 };
 #[derive(Clone, Copy)]
@@ -28,14 +28,14 @@ impl Colors {
             }
         };
         Self {
-            bg: mix(0x0b0b0d, 0xfafafa),
-            side: mix(0x111113, 0xf2f2f3),
-            surface: mix(0x161619, 0xffffff),
-            raised: mix(0x202024, 0xededee),
-            border: mix(0x29292e, 0xe1e1e4),
+            bg: mix(0x18181b, 0xffffff),
+            side: mix(0x111113, 0xf7f7f8),
+            surface: mix(0x202023, 0xffffff),
+            raised: mix(0x2b2b30, 0xededee),
+            border: mix(0x333338, 0xe4e4e7),
             text: mix(0xf4f4f5, 0x171719),
             muted: mix(0xa1a1aa, 0x66666f),
-            faint: mix(0x62626c, 0x9999a2),
+            faint: mix(0x94949e, 0x707078),
             inverse: mix(0x121214, 0xffffff),
         }
     }
@@ -159,7 +159,7 @@ pub fn input(t: &Theme, s: text_input::Status) -> text_input::Style {
 pub fn editor(t: &Theme, _: text_editor::Status) -> text_editor::Style {
     let c = Colors::from_theme(t);
     text_editor::Style {
-        background: Background::Color(c.surface),
+        background: Background::Color(Color::TRANSPARENT),
         border: Border::default(),
         placeholder: c.faint,
         value: c.text,
@@ -185,14 +185,7 @@ pub fn picker(t: &Theme, s: pick_list::Status) -> pick_list::Style {
     }
 }
 pub fn composer(c: Colors) -> container::Style {
-    let mut s = panel(c, 15.);
-    s.shadow = Shadow {
-        color: Color {
-            a: 0.14,
-            ..Color::BLACK
-        },
-        offset: Vector::new(0., 6.),
-        blur_radius: 24.,
-    };
+    let mut s = panel(c, 22.);
+    s.border.color = c.border;
     s
 }

@@ -1,5 +1,13 @@
 //! Native workspace presentation. State and actions live in `gui`.
-use super::{App, Msg};
+// THESIS: a focused conversation workspace familiar to users of T3 Code and ChatGPT.
+// OWN-WORLD: graphite and paper surfaces, DM Sans, precise seams, quiet state colors.
+// STORY: choose a project or chat, connect an official CLI, then work in one transcript.
+// FIRST VIEWPORT: compact left rail; spacious conversation; centered, anchored composer.
+// FORM: the user's explicit T3 Code / ChatGPT commitment overrides seed 1fbf973f.
+// FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+use super::{App, Msg, Preference, SettingsTab};
+#[path = "settings_ui.rs"]
+mod settings_ui;
 use crate::{
     appearance as a,
     appearance::Colors,
@@ -10,15 +18,18 @@ use iced::{
     font::Weight,
     widget::{
         Space, button, checkbox, column, container, markdown, mouse_area, opaque, pick_list,
-        progress_bar, row, scrollable, stack, text, text_editor, text_input, tooltip,
+        progress_bar, row, scrollable, stack, svg, text, text_editor, text_input, tooltip,
     },
 };
-use spark_code::model::{Message, Provider};
+use spark_code::{
+    model::{Message, Provider},
+    provider_status::Readiness,
+};
 
 fn semibold() -> Font {
     Font {
         weight: Weight::Semibold,
-        ..Font::with_name("Inter Variable")
+        ..Font::with_name("DM Sans")
     }
 }
 fn line<'a>(c: Colors) -> Element<'a, Msg> {
@@ -103,11 +114,11 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             let center =
                 container(center).padding(iced::padding::top((1. - app.motion_progress()) * 7.));
             let mut workspace = row![].height(Length::Fill);
-            if app.sidebar_visible {
+            if app.sidebar_visible || app.settings {
                 workspace = workspace.push(sidebar(app)).push(vertical_line(c));
             }
             workspace = workspace.push(column![toolbar(app), line(c), center].width(Length::Fill));
-            if app.show_agents {
+            if app.show_agents && !app.settings {
                 workspace = workspace.push(vertical_line(c)).push(activity(app));
             }
             workspace.into()
@@ -189,11 +200,86 @@ fn titlebar(app: &App) -> Element<'_, Msg> {
     .into()
 }
 
+fn settings_sidebar(app: &App) -> Element<'_, Msg> {
+    let c = app.colors();
+    let heading = row![
+        text("Settings").size(13).font(semibold()).color(c.text),
+        Space::new().width(Length::Fill),
+    ]
+    .align_y(Alignment::Center);
+    let mut tabs = column![].spacing(5);
+    for tab in SettingsTab::ALL {
+        let kind = match tab {
+            SettingsTab::General => Kind::Settings,
+            SettingsTab::Appearance => Kind::Sun,
+            SettingsTab::Providers => Kind::Terminal,
+            SettingsTab::ChatGpt => Kind::Chat,
+            SettingsTab::Performance => Kind::Bolt,
+            SettingsTab::Data => Kind::Folder,
+            SettingsTab::Shortcuts => Kind::Code,
+        };
+        tabs = tabs.push(
+            button(
+                row![
+                    icon(kind, 16., c.muted),
+                    text(tab.title()).size(13),
+                    Space::new().width(Length::Fill)
+                ]
+                .spacing(11)
+                .align_y(Alignment::Center),
+            )
+            .padding([11, 10])
+            .width(Length::Fill)
+            .style(if app.settings_tab == tab {
+                a::selected
+            } else {
+                a::ghost
+            })
+            .on_press(Msg::SettingsTab(tab)),
+        );
+    }
+    let back = button(
+        row![
+            icon(Kind::Back, 15., c.muted),
+            text("Back").size(12),
+            Space::new().width(Length::Fill)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Msg::Settings)
+    .padding([8, 9])
+    .width(Length::Fill)
+    .style(a::ghost);
+    container(
+        column![
+            heading,
+            Space::new().height(5),
+            tabs,
+            Space::new().height(Length::Fill),
+            line(c),
+            back,
+        ]
+        .spacing(8),
+    )
+    .padding([12, 12])
+    .width(248)
+    .height(Length::Fill)
+    .style(move |_| a::flat(c.side))
+    .into()
+}
+
 fn sidebar(app: &App) -> Element<'_, Msg> {
+    if app.settings {
+        return settings_sidebar(app);
+    }
     let c = app.colors();
     let e = app.engine.as_ref().unwrap();
     let heading = row![
-        text("Workspace").size(13).font(semibold()).color(c.text),
+        text("Your workspace")
+            .size(13)
+            .font(semibold())
+            .color(c.text),
         Space::new().width(Length::Fill),
         icon_button(Kind::Panel, "Hide sidebar", Msg::ToggleSidebar, c),
     ]
@@ -201,8 +287,9 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
     let new_chat = button(
         row![
             icon(Kind::Plus, 15., c.text),
-            text("New chat").size(12),
-            Space::new().width(Length::Fill)
+            text("New chat").size(13),
+            Space::new().width(Length::Fill),
+            text("Ctrl N").size(10).color(c.faint),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -210,7 +297,7 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
     .on_press(Msg::New)
     .padding([9, 10])
     .width(Length::Fill)
-    .style(a::outline);
+    .style(a::selected);
     let search = container(
         row![
             icon(Kind::Search, 14., c.faint),
@@ -231,42 +318,13 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
         .align_y(Alignment::Center),
     )
     .padding([0, 8]);
-    let mut projects = column![
-        row![
-            section_label("PROJECTS", c),
-            Space::new().width(Length::Fill),
-            icon_button(Kind::Plus, "Add project folder", Msg::AddProject, c)
-        ]
-        .align_y(Alignment::Center)
+    let projects_heading = row![
+        section_label("PROJECTS", c),
+        Space::new().width(Length::Fill),
+        icon_button(Kind::Plus, "Add project folder", Msg::AddProject, c)
     ]
-    .spacing(3);
-    projects = projects.push(
-        button(
-            row![
-                icon(
-                    Kind::Chat,
-                    15.,
-                    if app.project.is_none() {
-                        c.text
-                    } else {
-                        c.muted
-                    }
-                ),
-                text("General chat").size(12),
-                Space::new().width(Length::Fill),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding([8, 9])
-        .style(if app.project.is_none() {
-            a::selected
-        } else {
-            a::ghost
-        })
-        .on_press(Msg::GeneralChat),
-    );
+    .align_y(Alignment::Center);
+    let mut projects = column![].spacing(3);
     for p in &e.projects {
         let selected = app.project.as_ref() == Some(&p.id);
         projects = projects.push(
@@ -286,7 +344,22 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
         );
     }
     let mut sessions = column![].spacing(3);
-    for s in &e.sessions {
+    let mut last_group = "";
+    let visible_sessions = app.filtered_sessions.as_deref().unwrap_or(&e.sessions);
+    for s in visible_sessions {
+        let age = spark_code::model::now().saturating_sub(s.updated);
+        let group = if age < 86400 {
+            "Today"
+        } else if age < 7 * 86400 {
+            "Previous 7 days"
+        } else {
+            "Earlier"
+        };
+        if group != last_group && app.search.is_empty() {
+            sessions =
+                sessions.push(container(text(group).size(11).color(c.faint)).padding([10, 9]));
+            last_group = group;
+        }
         let selected = app.selected.as_ref() == Some(&s.id) && !app.settings;
         let running = e.jobs.contains_key(&s.id);
         sessions = sessions.push(
@@ -308,7 +381,7 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
             .style(if selected { a::selected } else { a::ghost }),
         );
     }
-    if e.sessions.is_empty() {
+    if visible_sessions.is_empty() {
         sessions = sessions.push(
             container(
                 text(if app.search.is_empty() {
@@ -322,12 +395,28 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
             .padding([9, 9]),
         );
     }
-    let mut bottom = column![
-        provider_usage(app, Provider::Codex, true),
-        provider_usage(app, Provider::Claude, true),
-        line(c)
-    ]
-    .spacing(9);
+    let mut bottom = column![line(c)].spacing(7);
+    for provider in Provider::ALL {
+        if e.settings.enabled(provider) {
+            bottom = bottom.push(provider_usage(app, provider, true));
+        }
+    }
+    bottom = bottom.push(
+        button(
+            row![
+                provider_mark(Provider::Codex, 15., c),
+                text("ChatGPT & Dots").size(12),
+                Space::new().width(Length::Fill),
+                icon(Kind::Chevron, 12., c.faint)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 9])
+        .width(Length::Fill)
+        .style(a::ghost)
+        .on_press(Msg::SettingsTab(SettingsTab::ChatGpt)),
+    );
     bottom = bottom.push(
         button(
             row![
@@ -372,7 +461,11 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
             new_chat,
             search,
             Space::new().height(8),
-            projects,
+            column![
+                projects_heading,
+                container(scrollable(projects)).max_height(64)
+            ]
+            .spacing(3),
             Space::new().height(14),
             section_label("CONVERSATIONS", c),
             scrollable(sessions).height(Length::Fill),
@@ -381,7 +474,7 @@ fn sidebar(app: &App) -> Element<'_, Msg> {
         .spacing(8),
     )
     .padding([12, 12])
-    .width(230)
+    .width(248)
     .height(Length::Fill)
     .style(move |_| a::flat(c.side))
     .into()
@@ -401,14 +494,14 @@ fn toolbar(app: &App) -> Element<'_, Msg> {
     let title = if app.preview.is_some() {
         "Import review".to_owned()
     } else if app.settings {
-        "Settings".to_owned()
+        format!("Settings / {}", app.settings_tab.title())
     } else {
         session
             .map(|s| ellipsize(&s.title.replace('\n', " "), 43))
             .unwrap_or_else(|| "New chat".into())
     };
     let mut items = row![].spacing(11).align_y(Alignment::Center);
-    if !app.sidebar_visible {
+    if !app.sidebar_visible && !app.settings {
         items = items.push(icon_button(
             Kind::Panel,
             "Show sidebar",
@@ -416,20 +509,29 @@ fn toolbar(app: &App) -> Element<'_, Msg> {
             c,
         ));
     }
+    if let (Some(project), false) = (project, app.settings) {
+        items = items
+            .push(icon(Kind::Folder, 14., c.faint))
+            .push(text(ellipsize(&project.name, 20)).size(12).color(c.muted))
+            .push(text("/").size(12).color(c.faint));
+    }
     items = items
-        .push(icon(Kind::Folder, 14., c.faint))
-        .push(
-            text(
-                project
-                    .map(|p| ellipsize(&p.name, 20))
-                    .unwrap_or_else(|| "General chat".into()),
-            )
-            .size(12)
-            .color(c.muted),
-        )
-        .push(text("/").size(12).color(c.faint))
         .push(text(title).size(12).color(c.text))
         .push(Space::new().width(Length::Fill));
+    if !app.settings && app.preview.is_none() {
+        items = items.push(
+            pick_list(Provider::ALL, Some(app.current_provider), Msg::Provider)
+                .text_size(12)
+                .padding([6, 8])
+                .style(a::picker),
+        );
+        items = items.push(icon_button(
+            Kind::Panel,
+            "Agent activity · Ctrl Shift A",
+            Msg::ToggleAgents,
+            c,
+        ));
+    }
     if !e.jobs.is_empty() {
         items = items.push(
             button(
@@ -473,7 +575,7 @@ fn chat(app: &App) -> Element<'_, Msg> {
     let transcript: Element<'_, Msg> = if !has_content {
         welcome(app)
     } else {
-        let mut messages = column![].spacing(28);
+        let mut messages = column![].spacing(if e.settings.compact_layout { 18 } else { 32 });
         for message in &app.messages {
             messages = messages.push(message_view(app, message, false));
         }
@@ -520,6 +622,13 @@ fn chat(app: &App) -> Element<'_, Msg> {
                 .padding([28, 26])
                 .center_x(Length::Fill),
         )
+        .id("transcript")
+        .on_scroll(|viewport| {
+            Msg::Scrolled(
+                viewport.absolute_offset().y
+                    >= (viewport.content_bounds().height - viewport.bounds().height - 36.).max(0.),
+            )
+        })
         .height(Length::Fill)
         .into()
     };
@@ -539,6 +648,13 @@ fn chat(app: &App) -> Element<'_, Msg> {
             .center_x(Length::Fill),
         );
     }
+    if !app.follow_stream && current.is_some() && e.settings.auto_scroll {
+        main = main.push(
+            container(compact_button("Jump to latest", Msg::JumpToLatest))
+                .center_x(Length::Fill)
+                .padding(5),
+        );
+    }
     main.push(composer(app)).into()
 }
 
@@ -549,33 +665,49 @@ fn welcome(app: &App) -> Element<'_, Msg> {
         .project
         .as_ref()
         .and_then(|id| e.projects.iter().find(|p| &p.id == id));
-    let context: Element<'_, Msg> = if let Some(project) = project {
-        tooltip(
-            container(
-                row![
-                    icon(Kind::Folder, 13., c.muted),
-                    text(ellipsize(&project.name, 52)).size(12).color(c.muted),
-                ]
-                .spacing(7)
-                .align_y(Alignment::Center),
-            )
-            .padding([6, 10]),
-            text(&project.path).size(11),
-            tooltip::Position::Bottom,
+    let title = project
+        .map(|p| format!("Let's work on {}", ellipsize(&p.name, 24)))
+        .unwrap_or_else(|| "What are we building today?".into());
+    let heading = text(title).size(32).font(semibold()).color(c.text);
+    let subtitle = if project.is_some() {
+        "Plan a change, explore your code, or let an agent help you build."
+    } else {
+        "A little clarity. A big idea. Your next great project."
+    };
+    let prompts = row![
+        suggestion("Explore code", "Help me understand the structure of this project and identify the important entry points.", Kind::Code, c),
+        suggestion("Fix a bug", "Help me investigate a bug. Start by asking me about the behavior and how to reproduce it.", Kind::Bug, c),
+        suggestion("Plan a feature", "Help me plan a feature. Ask about the requirements, then outline an implementation plan.", Kind::Plus, c),
+    ].spacing(10).wrap();
+    let connection: Element<'_, Msg> = if !app.provider_ready(app.current_provider) {
+        button(
+            row![
+                icon(Kind::Terminal, 14., c.muted),
+                text("Connect your agent to get started").size(12),
+                icon(Kind::Chevron, 12., c.faint)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         )
-        .gap(5)
+        .padding([9, 12])
+        .style(a::ghost)
+        .on_press(Msg::SettingsTab(SettingsTab::Providers))
         .into()
     } else {
-        text("General chat").size(12).color(c.faint).into()
+        text("Connected through your official CLI")
+            .size(11)
+            .color(c.faint)
+            .into()
     };
     let content = column![
-        container(icon(Kind::Bolt, 32., c.text)).center_x(Length::Fill),
+        container(icon(Kind::Bolt, 38., c.text)).center_x(Length::Fill),
         Space::new().height(8),
-        text("What are we building next?")
-            .size(29)
-            .font(semibold())
-            .color(c.text),
-        context,
+        heading,
+        text(subtitle).size(14).color(c.muted),
+        Space::new().height(18),
+        prompts,
+        Space::new().height(10),
+        connection,
     ]
     .spacing(11)
     .align_x(Alignment::Center)
@@ -587,15 +719,37 @@ fn welcome(app: &App) -> Element<'_, Msg> {
         .into()
 }
 
-/// Simple original provider marks, not provider logos.
+fn suggestion<'a>(
+    label: &'static str,
+    prompt: &'static str,
+    kind: Kind,
+    c: Colors,
+) -> Element<'a, Msg> {
+    button(
+        row![icon(kind, 15., c.muted), text(label).size(12)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([12, 15])
+    .style(a::outline)
+    .on_press(Msg::QuickPrompt(prompt.into()))
+    .into()
+}
+
+/// Official provider logos as embedded SVGs: OpenAI (theme text color) and Claude (brand orange).
 fn provider_mark<'a>(provider: Provider, size: f32, c: Colors) -> Element<'a, Msg> {
-    match provider {
-        Provider::Codex => icon(Kind::Bolt, size, c.muted),
-        Provider::Claude => container(text("A").font(semibold()).size(size - 1.).color(c.muted))
-            .center_x(size)
-            .center_y(size)
-            .into(),
-    }
+    let (bytes, tint): (&'static [u8], Color) = match provider {
+        Provider::Codex => (include_bytes!("../assets/icons/openai.svg"), c.text),
+        Provider::Claude => (
+            include_bytes!("../assets/icons/claude.svg"),
+            Color::from_rgb8(0xD9, 0x77, 0x57),
+        ),
+    };
+    svg(svg::Handle::from_memory(bytes))
+        .width(size)
+        .height(size)
+        .style(move |_, _| svg::Style { color: Some(tint) })
+        .into()
 }
 
 fn usage_meter<'a>(fraction: f32, c: Colors) -> Element<'a, Msg> {
@@ -645,7 +799,7 @@ fn provider_usage(app: &App, provider: Provider, compact: bool) -> Element<'_, M
                 .padding([5, 9])
                 .width(Length::Fill)
                 .style(a::ghost)
-                .on_press(Msg::Settings),
+                .on_press(Msg::SettingsTab(SettingsTab::Providers)),
             text(label).size(11),
             tooltip::Position::Right,
         )
@@ -685,11 +839,25 @@ fn message_view<'a>(app: &'a App, message: &'a Message, streaming: bool) -> Elem
     let body: Element<'a, Msg> = if let Some((_, content)) = app.rendered.get(&message.id) {
         markdown::view(
             content.items(),
-            markdown::Settings::with_text_size(15, &app.theme()),
+            markdown::Settings::with_text_size(
+                app.engine
+                    .as_ref()
+                    .map(|e| e.settings.chat_text_size)
+                    .unwrap_or(15),
+                app.theme(),
+            ),
         )
         .map(|uri| Msg::OpenLink(uri.to_string()))
     } else {
-        text(&message.text).size(15).color(c.text).into()
+        text(&message.text)
+            .size(
+                app.engine
+                    .as_ref()
+                    .map(|e| e.settings.chat_text_size)
+                    .unwrap_or(15),
+            )
+            .color(c.text)
+            .into()
     };
     if is_user {
         let bubble = container(body)
@@ -705,12 +873,20 @@ fn message_view<'a>(app: &'a App, message: &'a Message, streaming: bool) -> Elem
             row![
                 Space::new().width(Length::Fill),
                 text("You").size(11).font(semibold()).color(c.muted),
-                icon_button(
-                    Kind::Copy,
-                    "Copy message",
-                    Msg::Copy(message.text.clone()),
-                    c
+                text(
+                    if app
+                        .engine
+                        .as_ref()
+                        .is_ok_and(|e| e.settings.show_timestamps)
+                    {
+                        super::ago_label(message.created)
+                    } else {
+                        String::new()
+                    }
                 )
+                .size(10)
+                .color(c.faint),
+                icon_button(Kind::Copy, "Copy message", Msg::Copy(message.id.clone()), c)
             ]
             .spacing(7)
             .align_y(Alignment::Center),
@@ -733,11 +909,25 @@ fn message_view<'a>(app: &'a App, message: &'a Message, streaming: bool) -> Elem
                 text(if streaming { "Working" } else { "" })
                     .size(10)
                     .color(c.faint),
+                text(
+                    if !streaming
+                        && app
+                            .engine
+                            .as_ref()
+                            .is_ok_and(|e| e.settings.show_timestamps)
+                    {
+                        super::ago_label(message.created)
+                    } else {
+                        String::new()
+                    }
+                )
+                .size(10)
+                .color(c.faint),
                 Space::new().width(Length::Fill),
                 icon_button(
                     Kind::Copy,
                     "Copy response",
-                    Msg::Copy(message.text.clone()),
+                    Msg::Copy(message.id.clone()),
                     c
                 ),
             ]
@@ -754,10 +944,6 @@ fn composer(app: &App) -> Element<'_, Msg> {
     let c = app.colors();
     let e = app.engine.as_ref().unwrap();
     let provider = app.selected_provider();
-    let project = app
-        .project
-        .as_ref()
-        .and_then(|id| e.projects.iter().find(|p| &p.id == id));
     let running = app
         .selected
         .as_ref()
@@ -766,7 +952,7 @@ fn composer(app: &App) -> Element<'_, Msg> {
     let model_name = app.model_name();
     let model_control: Element<'_, Msg> = if app.provider_ready(provider) && !models.is_empty() {
         row![
-            provider_mark(provider, 13., c),
+            provider_mark(provider, 15., c),
             pick_list(
                 models,
                 models.iter().find(|model| *model == &app.model),
@@ -783,7 +969,7 @@ fn composer(app: &App) -> Element<'_, Msg> {
         .into()
     } else {
         let mut model = row![
-            provider_mark(provider, 13., c),
+            provider_mark(provider, 15., c),
             text(model_name).size(11).color(c.muted)
         ]
         .spacing(6)
@@ -795,7 +981,7 @@ fn composer(app: &App) -> Element<'_, Msg> {
             button(model)
                 .padding([5, 7])
                 .style(a::ghost)
-                .on_press(Msg::Settings),
+                .on_press(Msg::SettingsTab(SettingsTab::Providers)),
             text(app.provider_hint(provider)).size(11),
             tooltip::Position::Top,
         )
@@ -809,7 +995,11 @@ fn composer(app: &App) -> Element<'_, Msg> {
                 .center_y(31),
         )
         .padding(0)
-        .style(a::primary)
+        .style(|theme, status| {
+            let mut style = a::primary(theme, status);
+            style.border.radius = 16.into();
+            style
+        })
         .on_press(Msg::Cancel(app.selected.clone().unwrap()))
     } else {
         button(
@@ -824,6 +1014,7 @@ fn composer(app: &App) -> Element<'_, Msg> {
         .padding(0)
         .style(move |theme, status| {
             let mut style = a::primary(theme, status);
+            style.border.radius = 16.into();
             if matches!(status, iced::widget::button::Status::Disabled) {
                 style.background = Some(c.raised.into());
             }
@@ -831,21 +1022,31 @@ fn composer(app: &App) -> Element<'_, Msg> {
         })
         .on_press_maybe(app.can_send().then_some(Msg::Send))
     };
-    let mut controls = row![model_control].spacing(5).align_y(Alignment::Center);
+    let divider = || -> Element<'_, Msg> {
+        container(Space::new().width(1).height(16))
+            .style(move |_| a::flat(c.border))
+            .into()
+    };
+    let mut controls = row![model_control].spacing(6).align_y(Alignment::Center);
     let efforts = app.supported_efforts();
     if !efforts.is_empty() {
-        controls = controls.push(tooltip(
-            pick_list(efforts, Some(app.effort.clone()), Msg::Effort)
-                .text_size(10)
-                .padding([5, 6])
-                .style(a::picker),
+        controls = controls.push(divider()).push(tooltip(
+            pick_list(
+                efforts,
+                (!app.effort.is_empty()).then(|| app.effort.clone()),
+                Msg::Effort,
+            )
+            .placeholder("Reasoning")
+            .text_size(10)
+            .padding([5, 6])
+            .style(a::picker),
             text("Reasoning effort").size(11),
             tooltip::Position::Top,
         ));
     }
     let access = app.access_choices();
     if !access.is_empty() {
-        controls = controls.push(tooltip(
+        controls = controls.push(divider()).push(tooltip(
             pick_list(access, Some(app.access.clone()), Msg::AccessRequested)
                 .text_size(10)
                 .padding([5, 6])
@@ -872,58 +1073,48 @@ fn composer(app: &App) -> Element<'_, Msg> {
     .spacing(8)
     .align_y(Alignment::Center);
     let mut content = column![].spacing(3);
-    if let Some(project) = project {
-        content = content.push(
-            tooltip(
-                container(
-                    row![
-                        icon(Kind::Folder, 12., c.muted),
-                        text(ellipsize(&project.name, 36)).size(10).color(c.muted)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding([5, 8])
-                .style(move |_| {
-                    let mut style = a::panel(c, 6.);
-                    style.border.width = 0.;
-                    style.background = Some(c.raised.into());
-                    style
-                }),
-                text(&project.path).size(11),
-                tooltip::Position::Top,
-            )
-            .gap(5),
-        );
-    }
     content = content
         .push(
             text_editor(&app.editor)
-                .placeholder("Ask anything…")
+                .placeholder(if app.project.is_some() {
+                    "Ask about your project, or describe a change…"
+                } else {
+                    "Ask anything, or start with an idea…"
+                })
                 .on_action(Msg::Edit)
                 .key_binding(super::composer_binding)
-                .size(14)
+                .size(e.settings.chat_text_size)
                 .height(67)
                 .padding([8, 3])
                 .style(a::editor),
         )
         .push(controls);
     let card = container(content)
-        .padding(12)
+        .padding([14, 16])
         .style(move |_| a::composer(c));
     let notice = if !app.notice.is_empty() {
         app.notice.as_str()
     } else {
         e.notice.as_str()
     };
-    let footer = row![
-        text(ellipsize(notice, 78)).size(10).color(c.faint),
-        Space::new().width(Length::Fill),
+    let mut footer = row![
+        text(ellipsize(notice, 140))
+            .size(10)
+            .color(c.faint)
+            .width(Length::Fill),
         text("Enter to send · Shift+Enter for new line")
             .size(10)
             .color(c.faint)
     ]
     .spacing(10);
+    if !notice.is_empty() {
+        footer = footer.push(icon_button(
+            Kind::Close,
+            "Dismiss notification",
+            Msg::DismissNotice,
+            c,
+        ));
+    }
     container(
         container(column![card, container(footer).padding([7, 4])].spacing(3))
             .max_width(860)
@@ -1012,10 +1203,10 @@ fn activity(app: &App) -> Element<'_, Msg> {
                     .spacing(6),
                 );
         }
-        if let Some(timeline) = e.timelines.get(id) {
-            if !timeline.is_empty() {
-                card = card.push(line(c)).push(timeline_view(timeline, c));
-            }
+        if let Some(timeline) = e.timelines.get(id)
+            && !timeline.is_empty()
+        {
+            card = card.push(line(c)).push(timeline_view(timeline, c));
         }
         if !job.usage.is_empty() {
             card = card.push(text(&job.usage).size(10).color(c.faint));
@@ -1032,24 +1223,23 @@ fn activity(app: &App) -> Element<'_, Msg> {
         .selected
         .as_ref()
         .is_some_and(|id| !e.jobs.contains_key(id))
+        && let Some(timeline) = selected_timeline.filter(|timeline| !timeline.is_empty())
     {
-        if let Some(timeline) = selected_timeline.filter(|timeline| !timeline.is_empty()) {
-            content = content.push(
-                container(
-                    column![
-                        text("Recent activity")
-                            .size(12)
-                            .font(semibold())
-                            .color(c.text),
-                        timeline_view(timeline, c)
-                    ]
-                    .spacing(12),
-                )
-                .padding(13)
-                .width(Length::Fill)
-                .style(move |_| a::panel(c, 9.)),
-            );
-        }
+        content = content.push(
+            container(
+                column![
+                    text("Recent activity")
+                        .size(12)
+                        .font(semibold())
+                        .color(c.text),
+                    timeline_view(timeline, c)
+                ]
+                .spacing(12),
+            )
+            .padding(13)
+            .width(Length::Fill)
+            .style(move |_| a::panel(c, 9.)),
+        );
     }
     container(
         column![
@@ -1110,208 +1300,172 @@ fn timeline_view<'a>(
     content.into()
 }
 
-fn settings(app: &App) -> Element<'_, Msg> {
+fn provider_row(app: &App, provider: Provider) -> Element<'_, Msg> {
     let c = app.colors();
     let e = app.engine.as_ref().unwrap();
-    let mut connections = column![
-        text("Provider connections")
-            .size(15)
-            .font(semibold())
-            .color(c.text),
-        text("Use your account through the official command-line app.")
-            .size(12)
-            .color(c.muted),
+    let state = e.providers.get(provider);
+    let enabled = e.settings.enabled(provider);
+    let name = super::provider_title(provider);
+    let open = app.expanded == Some(provider);
+    let dot_color = if !enabled {
+        Color::from_rgb8(0xF5, 0xA6, 0x23)
+    } else {
+        match state.readiness {
+            Readiness::Ready => Color::from_rgb8(0x22, 0xC5, 0x7B),
+            Readiness::Checking | Readiness::Unchecked => Color::from_rgb8(0xF5, 0xA6, 0x23),
+            _ => Color::from_rgb8(0xE5, 0x48, 0x4D),
+        }
+    };
+    let dot = container(Space::new().width(8).height(8)).style(move |_| container::Style {
+        background: Some(dot_color.into()),
+        border: iced::Border {
+            radius: 4.into(),
+            color: c.bg,
+            width: 1.5,
+        },
+        ..Default::default()
+    });
+    let mark = stack![
+        container(provider_mark(provider, 18., c)).padding([4, 4]),
+        dot
+    ];
+    let subtitle = if !enabled {
+        format!("Disabled - {name} is disabled in Spark Code settings.")
+    } else {
+        match state.readiness {
+            Readiness::Ready if !state.status.is_empty() => state.status.clone(),
+            Readiness::Ready => "Connected".into(),
+            Readiness::Checking => "Checking the official CLI connection…".into(),
+            Readiness::Unchecked => "Not checked yet. Use refresh to check this provider.".into(),
+            _ => state.status.clone(),
+        }
+    };
+    let mut title = row![text(name).size(14).font(semibold()).color(c.text)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if !state.version.is_empty() {
+        title = title.push(
+            text(format!("v{}", state.version))
+                .size(11)
+                .font(Font::MONOSPACE)
+                .color(c.faint),
+        );
+    }
+    let toggle = iced::widget::toggler(enabled)
+        .size(20)
+        .on_toggle(move |value| Msg::ToggleProvider(provider, value))
+        .style(move |_, status| {
+            let on = matches!(
+                status,
+                iced::widget::toggler::Status::Active { is_toggled: true }
+                    | iced::widget::toggler::Status::Hovered { is_toggled: true }
+                    | iced::widget::toggler::Status::Disabled { is_toggled: true }
+            );
+            iced::widget::toggler::Style {
+                background: if on {
+                    Color::from_rgb8(0x3B, 0x6E, 0xF6).into()
+                } else {
+                    c.raised.into()
+                },
+                background_border_width: 1.,
+                background_border_color: if on { Color::TRANSPARENT } else { c.border },
+                foreground: if on {
+                    Color::WHITE.into()
+                } else {
+                    c.muted.into()
+                },
+                foreground_border_width: 0.,
+                foreground_border_color: Color::TRANSPARENT,
+                text_color: None,
+                border_radius: None,
+                padding_ratio: 0.2,
+            }
+        });
+    let head = row![
+        mark,
+        column![title, text(subtitle).size(12).color(c.muted)]
+            .spacing(4)
+            .width(Length::Fill),
+        button(
+            container(icon(
+                if open { Kind::ChevronUp } else { Kind::Chevron },
+                16.,
+                c.muted
+            ))
+            .center_x(30)
+            .center_y(28),
+        )
+        .padding(0)
+        .style(a::ghost)
+        .on_press(Msg::ToggleExpand(provider)),
+        toggle,
     ]
-    .spacing(10);
-    for provider in Provider::ALL {
-        let (title, description, path) = match provider {
-            Provider::Codex => ("Codex / ChatGPT", "OpenAI account", &e.settings.codex_path),
-            Provider::Claude => ("Claude", "Anthropic account", &e.settings.claude_path),
+    .spacing(12)
+    .align_y(Alignment::Center);
+    let mut body = column![head].spacing(14);
+    if open {
+        let path = match provider {
+            Provider::Codex => &e.settings.codex_path,
+            Provider::Claude => &e.settings.claude_path,
         };
         let input = text_input(provider.cli(), path)
-            .size(12)
-            .padding(9)
+            .size(13)
+            .padding([9, 11])
             .style(a::input)
-            .on_input(move |value| {
-                if provider == Provider::Codex {
-                    Msg::CodexPath(value)
-                } else {
-                    Msg::ClaudePath(value)
-                }
+            .on_input(move |value| match provider {
+                Provider::Codex => Msg::CodexPath(value),
+                Provider::Claude => Msg::ClaudePath(value),
             });
-        let card = container(
+        body = body.push(
             column![
-                row![
-                    container(provider_mark(provider, 18., c))
-                        .padding(10)
-                        .style(move |_| a::panel(c, 8.)),
-                    column![
-                        text(title).size(13).font(semibold()).color(c.text),
-                        text(description).size(11).color(c.muted)
-                    ]
-                    .spacing(3),
-                    Space::new().width(Length::Fill),
-                    compact_button("Setup guide", Msg::OpenDocs(provider))
-                ]
-                .spacing(12)
-                .align_y(Alignment::Center),
-                row![
-                    icon(
-                        if app.provider_ready(provider) {
-                            Kind::Bolt
-                        } else {
-                            Kind::Lock
-                        },
-                        13.,
-                        c.muted
-                    ),
-                    text(app.provider_hint(provider)).size(11).color(c.muted)
-                ]
-                .spacing(7)
-                .align_y(Alignment::Center),
-                provider_usage(app, provider, false),
-                row![text("Executable").size(11).color(c.muted).width(78), input]
-                    .spacing(9)
-                    .align_y(Alignment::Center),
-                row![
-                    compact_button("Sign in", Msg::Login(provider)),
-                    button(
-                        row![icon(Kind::Refresh, 12., c.muted), text("Refresh").size(11)]
-                            .spacing(6)
-                            .align_y(Alignment::Center)
-                    )
-                    .padding([7, 10])
-                    .style(a::ghost)
-                    .on_press_maybe(app.probe_receiver.is_none().then_some(Msg::Probe(provider))),
-                    Space::new().width(Length::Fill),
-                    compact_button(
-                        if app.selected_provider() == provider {
-                            "Selected for chat"
-                        } else {
-                            "Use for chat"
-                        },
-                        Msg::Provider(provider)
-                    )
-                    .style(if app.selected_provider() == provider {
-                        a::selected
-                    } else {
-                        a::outline
-                    }),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
+                text("Binary path").size(12).font(semibold()).color(c.text),
+                input,
+                text(format!("Path to the {name} binary used by Spark Code."))
+                    .size(11)
+                    .color(c.faint),
             ]
-            .spacing(13),
-        )
-        .padding(16)
-        .width(Length::Fill)
-        .style(move |_| a::panel(c, 11.));
-        connections = connections.push(card);
-    }
-    connections = connections
-        .push(
-            text("Sign-in opens the official CLI. Spark Code doesn't store account credentials.")
-                .size(11)
-                .color(c.faint),
-        )
-        .push(compact_button("Save connection settings", Msg::SaveSettings).style(a::primary));
-    let appearance = container(
-        column![
+            .spacing(7),
+        );
+        if !state.usage_windows.is_empty() {
+            body = body.push(provider_usage(app, provider, false));
+        }
+        body = body.push(
             row![
-                column![
-                    text("Appearance").size(13).font(semibold()).color(c.text),
-                    text("A quiet workspace, in your preferred light.")
-                        .size(11)
-                        .color(c.muted)
-                ]
-                .spacing(4),
+                compact_button(
+                    if provider == Provider::Codex {
+                        "Sign in with ChatGPT"
+                    } else {
+                        "Sign in to Claude"
+                    },
+                    Msg::Login(provider)
+                ),
                 Space::new().width(Length::Fill),
                 compact_button(
-                    if e.settings.light_theme {
-                        "Switch to dark"
+                    if app.selected_provider() == provider {
+                        "Selected for chat"
                     } else {
-                        "Switch to light"
+                        "Use for chat"
                     },
-                    Msg::ToggleTheme
-                ),
+                    Msg::Provider(provider)
+                )
+                .on_press_maybe(
+                    (app.selected_provider() != provider).then_some(Msg::Provider(provider))
+                )
+                .style(if app.selected_provider() == provider {
+                    a::selected
+                } else {
+                    a::outline
+                }),
             ]
-            .spacing(12)
+            .spacing(8)
             .align_y(Alignment::Center),
-            line(c),
-            row![
-                column![
-                    text("Reduced motion").size(12).color(c.text),
-                    text("Keep transitions immediate.").size(11).color(c.muted)
-                ]
-                .spacing(4),
-                Space::new().width(Length::Fill),
-                checkbox(e.settings.reduced_motion).on_toggle(Msg::ReducedMotion),
-            ]
-            .align_y(Alignment::Center),
-        ]
-        .spacing(15),
-    )
-    .padding(16)
-    .width(Length::Fill)
-    .style(move |_| a::panel(c, 11.));
-    let capacity = container(column![row![column![text("Concurrent agents").size(13).font(semibold()).color(c.text),
-        text("Run up to four agents in separate project folders.").size(11).color(c.muted)].spacing(5),
-        Space::new().width(Length::Fill), text_input("2", &e.concurrency.to_string()).on_input(Msg::Concurrency)
-            .size(12).padding(8).width(54).style(a::input),
-    ].spacing(12).align_y(Alignment::Center),
-        text("More agents use more memory and subscription capacity. Each folder is limited to one active agent.").size(11).color(c.faint),
-    ].spacing(12)).padding(16).width(Length::Fill).style(move |_| a::panel(c, 11.));
-    let imports = container(column![text("Conversation history").size(13).font(semibold()).color(c.text),
-        text("Preview and choose what to bring with you. Nothing is imported automatically.").size(12).color(c.muted),
-        row![button(text("Choose backup file…").size(12)).padding([8, 11]).style(a::outline)
-                .on_press_maybe((!app.importing).then_some(Msg::ImportFile)),
-            button(text("Preview Codex history").size(12)).padding([8, 11]).style(a::outline)
-                .on_press_maybe((!app.importing).then_some(Msg::ImportCodex)),
-        ].spacing(8),
-        line(c),
-        row![text("Keep a private copy of your conversations.").size(11).color(c.muted), Space::new().width(Length::Fill),
-            compact_button("Export history", Msg::Export)].spacing(8).align_y(Alignment::Center),
-        text("T3 backups preserve messages and project paths, then start fresh provider sessions.").size(11).color(c.faint),
-    ].spacing(13)).padding(16).width(Length::Fill).style(move |_| a::panel(c, 11.));
-    let privacy = container(column![text("Private by default").size(12).font(semibold()).color(c.muted),
-        text("Your local transcripts and exported backups are unencrypted and include messages and project paths. Keep backups private.").size(11).color(c.faint),
-        text("Claude Code on native Windows has no OS-level sandbox. Review tool requests carefully.").size(11).color(c.faint),
-        text("Spark Code is independent of OpenAI and Anthropic.").size(10).color(c.faint),
-    ].spacing(8)).padding([6, 2]);
-    let content = column![
-        text("Make it yours")
-            .size(25)
-            .font(semibold())
-            .color(c.text),
-        text("Your workspace, tools, and preferences.")
-            .size(13)
-            .color(c.muted),
-        Space::new().height(8),
-        connections,
-        Space::new().height(5),
-        text("Workspace").size(15).font(semibold()).color(c.text),
-        appearance,
-        capacity,
-        Space::new().height(5),
-        text("Your data").size(15).font(semibold()).color(c.text),
-        imports,
-        text(if app.importing {
-            "Reading selected history…"
-        } else {
-            &app.notice
-        })
-        .size(11)
-        .color(c.muted),
-        privacy,
-    ]
-    .spacing(15);
-    scrollable(
-        container(container(content).max_width(760).width(Length::Fill))
-            .padding([30, 30])
-            .center_x(Length::Fill),
-    )
-    .height(Length::Fill)
-    .into()
+        );
+    }
+    container(body).padding([4, 0]).into()
+}
+
+fn settings(app: &App) -> Element<'_, Msg> {
+    settings_ui::view(app)
 }
 
 fn import_review(app: &App) -> Element<'_, Msg> {
