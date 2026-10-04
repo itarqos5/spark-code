@@ -1,4 +1,4 @@
-# Spark Code 1.1.0 features and boundaries
+# Spark Code features and boundaries
 
 ## Native desktop and terminal
 
@@ -6,6 +6,7 @@
 - No Electron, embedded web preview, or bundled browser engine
 - Native desktop typography using embedded DM Sans; neutral dark/light themes saved between launches
 - Short, bounded theme/layout transitions and a saved reduced-motion setting
+- Three-step animated first-launch setup with working appearance, provider, project, and history controls; skip and replay supported, completion persisted
 - Spark Code bolt branding and Windows display/search metadata; executable names and terminal command remain lowercase `spark-code`
 - Custom draggable desktop title bar with minimize, maximize/restore, and close; resize edges/corners and a native Windows system menu
 - A focused “What are we building next?” welcome screen with one canonical Projects add control
@@ -50,16 +51,22 @@ Spark Code cannot reset provider quotas, guarantee free usage, or infer a remain
 
 The Codex connection reuses the installed CLI's ChatGPT-managed authentication; the CLI owns credential storage and refresh. Spark Code does not copy a ChatGPT browser token or another application's credentials. Settings provides official ChatGPT and Dots links. Dots and other ChatGPT-only tools continue to run in ChatGPT; a native Dots API integration is not claimed. See [Codex authentication](https://developers.openai.com/codex/auth) and [Meet dots](https://learn.chatgpt.com/docs/dots).
 
-## Explicit, previewed imports
+## Linked history and previewed file imports
 
-- Import only from Settings after an explicit request and conversation-selection preview
+- Discover local Codex and T3 Code databases automatically; import with Sync now or opt into startup and minute-by-minute sync
+- Read live SQLite WAL snapshots in a background worker; source rows are never modified
+- Per-source enable switches, custom data folders, source availability, and sync results
+- A bounded window of the latest 200 active conversations and 100 text messages each; source deletions don't delete imported history, and local replies are preserved
+- Codex uses its local thread/history databases, with bounded rollout JSONL fallback for older CLI installations; internal subagent chats and hidden reasoning are excluded
+- `spark-code history-sources` lists locations; `spark-code sync-history` imports enabled sources without opening the desktop
+- File imports still use an explicit conversation-selection preview
 - Compatible native Codex history through official APIs, supported T3 Code projection SQLite backups, and Spark Code JSON/ZIP backups
 - Compatible native Codex threads can resume through the official provider
 - Imported T3 text is not silently sent: an explicit desktop action places a small recent excerpt into the draft for review
 - Project paths are references, not copies of source files or worktrees; missing paths must be re-added on the current machine
 - T3 imports preserve supported text and paths, not all attachments, tool state, provider state, or branch metadata; unknown schema shapes are rejected
 
-Use a consistent T3 SQLite backup rather than a live database with WAL/SHM sidecars. Credentials stay with the official CLIs. Local history and exported backups are unencrypted.
+For file import, use a consistent T3 SQLite backup rather than a live database with WAL/SHM sidecars. Connected history reads the live database directly, including its WAL. Database-imported conversations start a fresh provider session; use the existing context action to review an excerpt before sending. Credentials stay with the official CLIs. Local history and exported backups are unencrypted.
 
 ## Packaging and verification
 

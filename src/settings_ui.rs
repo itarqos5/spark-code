@@ -1,6 +1,67 @@
 //! Settings surfaces share the same row hierarchy and persist through the GUI update path.
 use super::*;
 use iced::widget::{column, toggler};
+use spark_code::local_import::SourceKind;
+
+pub(super) fn history_sources(app: &App) -> Element<'_, Msg> {
+    let c = app.colors();
+    let s = &app.engine.as_ref().unwrap().settings;
+    let mut cards = column![].spacing(10);
+    for kind in SourceKind::ALL {
+        let source = app
+            .history_sources
+            .iter()
+            .find(|source| source.kind == kind);
+        let available = source.is_some_and(|source| source.available());
+        let path = source
+            .map(|source| source.path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Detecting local data folder…".into());
+        let mut header = row![
+            checkbox(kind.enabled(s))
+                .label(kind.label())
+                .text_size(13)
+                .on_toggle(move |v| Msg::HistorySource(kind, v)),
+            Space::new().width(Length::Fill),
+            text(if available { "Found" } else { "Not found" })
+                .size(11)
+                .color(c.muted)
+        ]
+        .align_y(Alignment::Center)
+        .spacing(10);
+        header = header.push(compact_button("Choose folder", Msg::HistoryFolder(kind)));
+        if !kind.folder(s).is_empty() {
+            header = header.push(compact_button("Reset", Msg::ResetHistoryFolder(kind)));
+        }
+        let mut body = column![
+            header,
+            text(ellipsize(&path, 88))
+                .size(11)
+                .font(Font::MONOSPACE)
+                .color(c.faint)
+        ]
+        .spacing(9);
+        if let Some(result) = app
+            .history_results
+            .iter()
+            .find(|r| r.source.kind == kind && source.is_some_and(|s| s.path == r.source.path))
+        {
+            let status = match &result.result {
+                Ok((added, sessions, messages)) => {
+                    format!("{sessions} conversations · {messages} messages · {added} new")
+                }
+                Err(error) => format!("Needs attention: {}", ellipsize(error, 220)),
+            };
+            body = body.push(text(status).size(12).color(c.muted));
+        }
+        cards = cards.push(
+            container(body)
+                .padding(14)
+                .width(Length::Fill)
+                .style(move |_| a::panel(c, 8.)),
+        );
+    }
+    cards.into()
+}
 
 fn toggle_row<'a>(
     label: &'static str,
@@ -71,6 +132,10 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
                 .push(section("Spark Code", c)).push(line(c))
                 .push(text(format!("Version {} · Native Rust desktop", env!("CARGO_PKG_VERSION"))).size(12).color(c.muted))
                 .push(text("Settings are saved automatically on this computer.").size(12).color(c.faint));
+            body = body.push(compact_button(
+                "Replay welcome setup",
+                Msg::ReplayOnboarding,
+            ));
         }
         SettingsTab::Appearance => {
             body = body
@@ -224,6 +289,13 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
                 .push(text("Idle workspaces stop polling. Markdown is cached, streaming updates are batched, and typing doesn't reload chat history.").size(12).color(c.faint));
         }
         SettingsTab::Data => {
+            body=body.push(section("Connected history",c)).push(line(c))
+                .push(toggle_row("Automatically import local history", "Sync enabled sources on launch and every minute. Changes flow into Spark Code.",s.auto_import_history,Msg::AutoImportHistory,c))
+                .push(history_sources(app))
+                .push(row![button(text(if app.history_receiver.is_some() {"Working…"} else {"Sync now"}).size(12)).padding([9,12]).style(a::primary).on_press_maybe(app.history_receiver.is_none().then_some(Msg::SyncHistory)),compact_button("Detect again",Msg::DiscoverHistory)].spacing(8))
+                .push(text(&app.history_status).size(12).color(c.muted))
+                .push(text("Imports the latest 200 conversations and up to 100 messages each. Original history stays in its source app. Local replies are preserved on every sync.").size(12).color(c.faint))
+                .push(text("Codex and T3 Code import directly from their databases, including changes in live WAL files. Choose a custom data folder if your installation stores history elsewhere.").size(12).color(c.muted));
             body = body.push(section("Import conversations", c)).push(line(c))
                 .push(text("Preview a Spark Code export or a T3 Code backup and choose the conversations to import.").size(13).color(c.muted))
                 .push(row![button(text("Choose backup file…").size(12)).padding([9, 12]).style(a::outline).on_press_maybe((!app.importing).then_some(Msg::ImportFile)),

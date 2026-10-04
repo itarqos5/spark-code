@@ -4,7 +4,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
-use spark_code::{engine::Engine, import, model::*, provider};
+use spark_code::{engine::Engine, import, local_import, model::*, provider};
 use std::{io, path::Path, sync::mpsc, time::Duration};
 #[derive(PartialEq)]
 enum Mode {
@@ -43,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("--help" | "-h") => {
             println!(
-                "spark-code {}\n\nUsage: spark-code [gui | doctor | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nF7 official login · F8 refresh account/models\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
+                "spark-code {}\n\nUsage: spark-code [gui | doctor | history-sources | sync-history | export FILE]\n\nWithout arguments: native terminal workspace\nF1 help · F2 sessions · F3 projects · F4 provider · F5 model\nF7 official login · F8 refresh account/models\nCtrl+N new chat · Enter send · Esc cancel/back · Ctrl+Q quit\n\nData: {}",
                 env!("CARGO_PKG_VERSION"),
                 spark_code::store::data_dir().display()
             );
@@ -75,6 +75,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let e = Engine::open()?;
             import::export(Path::new(p), &e.store.backup()?)?;
             println!("Exported to {p}. Keep it private: it contains messages and project paths.");
+            return Ok(());
+        }
+        Some("history-sources" | "sync-history") => {
+            let e = Engine::open()?;
+            let sources = local_import::discover(&e.settings);
+            for source in &sources {
+                println!(
+                    "{}: {} · {}",
+                    source.kind.label(),
+                    if source.available() {
+                        "found"
+                    } else {
+                        "not found"
+                    },
+                    source.path.display()
+                );
+            }
+            if args[1] == "sync-history" {
+                let mut failures = 0;
+                for report in local_import::sync(sources, &e.settings, &e.store.path()) {
+                    match report.result {
+                        Ok((added, sessions, messages)) => println!(
+                            "{}: {sessions} conversations, {messages} messages, {added} new",
+                            report.source.kind.label()
+                        ),
+                        Err(error) => {
+                            failures += 1;
+                            eprintln!("{}: {error}", report.source.kind.label());
+                        }
+                    }
+                }
+                if failures > 0 {
+                    return Err(format!("{failures} history sources could not sync").into());
+                }
+            }
             return Ok(());
         }
         Some(s) => return Err(format!("Unknown command {s}. Run spark-code --help").into()),

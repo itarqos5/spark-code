@@ -259,6 +259,14 @@ The five sidecar HTML/CSS snippets represent native components; they are not the
 
 ## Do's and Don'ts
 
+### First-launch setup and connected history
+
+The optional first-launch setup has three steps: appearance, official CLI connections and project selection, then Codex/T3 history. A 300-pixel graphite side panel holds the bolt, a small native vector workspace illustration, and clickable step markers. The form occupies the remaining width, scrolls independently, and keeps Back, Skip, and Continue/Open workspace visible in a fixed footer. The setup reuses DM Sans, existing neutral surfaces, foreground primary buttons, and eight-pixel source-card corners. Skip and completion persist; General settings can replay it.
+
+Each step uses an 800 ms finite entrance with cubic easing: the content settles by 18 pixels, illustrated cards assemble with staggered arrivals, and connecting lines appear. Reduced motion renders the final state immediately, and the animation timer stops once the entrance completes. Theme changes retain the existing 200 ms transition.
+
+Connected-history cards in Data & history share the same source controls used during setup. Each shows a source switch, detected path, availability, folder override/reset, and its last sync result. The primary action is Sync now; the startup/minute sync preference is explicit and saved. These controls use the existing settings hierarchy and theme roles.
+
 ### Do:
 
 - **Do** preserve the graphite and white theme roles and foreground-colored primary actions.

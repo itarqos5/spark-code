@@ -6,6 +6,8 @@
 // FORM: the user's explicit T3 Code / ChatGPT commitment overrides seed 1fbf973f.
 // FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
 use super::{App, Msg, Preference, SettingsTab};
+#[path = "onboarding_ui.rs"]
+mod onboarding_ui;
 #[path = "settings_ui.rs"]
 mod settings_ui;
 use crate::{
@@ -103,6 +105,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .into(),
+        Ok(_) if app.onboarding.is_some() => onboarding_ui::view(app),
         Ok(_) => {
             let center = if app.preview.is_some() {
                 import_review(app)
@@ -166,8 +169,16 @@ fn titlebar(app: &App) -> Element<'_, Msg> {
                 Msg::ToggleTheme,
                 c
             ),
-            icon_button(Kind::Settings, "Settings", Msg::Settings, c),
-            icon_button(Kind::Panel, "Agent activity", Msg::ToggleAgents, c),
+            if app.onboarding.is_none() {
+                icon_button(Kind::Settings, "Settings", Msg::Settings, c)
+            } else {
+                Space::new().width(0).into()
+            },
+            if app.onboarding.is_none() {
+                icon_button(Kind::Panel, "Agent activity", Msg::ToggleAgents, c)
+            } else {
+                Space::new().width(0).into()
+            },
             Space::new().width(8),
             button(
                 container(icon(Kind::Minimize, 13., c.muted))
@@ -637,7 +648,9 @@ fn chat(app: &App) -> Element<'_, Msg> {
         .selected
         .as_ref()
         .and_then(|id| e.sessions.iter().find(|s| &s.id == id))
-        .is_some_and(|s| s.id.starts_with("t3:") && s.remote_id.is_none())
+        .is_some_and(|s| {
+            (s.id.starts_with("t3:") || s.id.starts_with("linked:")) && s.remote_id.is_none()
+        })
     {
         main = main.push(
             container(compact_button(

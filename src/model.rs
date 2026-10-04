@@ -109,6 +109,13 @@ pub struct Settings {
     pub visible_messages: usize,
     pub stream_interval_ms: u64,
     pub antialiasing: bool,
+    pub onboarding_complete: bool,
+    pub auto_import_history: bool,
+    pub history_codex: bool,
+    pub history_t3: bool,
+    pub codex_history_dir: String,
+    pub t3_history_dir: String,
+    pub history_last_sync: i64,
 }
 impl Settings {
     /// Clamp persisted preferences before they reach layout, timers, or allocations.
@@ -154,6 +161,13 @@ impl Default for Settings {
             visible_messages: 50,
             stream_interval_ms: 33,
             antialiasing: false,
+            onboarding_complete: false,
+            auto_import_history: false,
+            history_codex: true,
+            history_t3: true,
+            codex_history_dir: String::new(),
+            t3_history_dir: String::new(),
+            history_last_sync: 0,
         }
     }
 }

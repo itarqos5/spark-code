@@ -6,6 +6,7 @@ use iced::{
 use spark_code::{
     engine::Engine,
     import,
+    local_import::{self, Source, SourceKind, SyncResult},
     model::*,
     provider,
     provider_status::{AccessMode, Readiness},
@@ -63,6 +64,25 @@ pub fn run() -> iced::Result {
 #[cfg(test)]
 mod workspace_preferences_tests {
     use super::*;
+    #[test]
+    fn first_launch_can_be_skipped_and_replayed_without_reappearing_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let mut engine = Engine::open_at(&path).unwrap();
+        engine.settings.auto_detect_cli = false;
+        let mut app = App::with_engine(Ok(engine));
+        assert_eq!(app.onboarding, Some(0));
+        let _ = app.update(Msg::ReducedMotion(true));
+        let _ = app.update(Msg::OnboardingStep(2));
+        assert!(app.onboarding_started.is_none());
+        let _ = app.update(Msg::FinishOnboarding);
+        assert!(app.onboarding.is_none());
+        assert!(Engine::open_at(&path).unwrap().settings.onboarding_complete);
+        let _ = app.update(Msg::ReplayOnboarding);
+        assert_eq!(app.onboarding, Some(0));
+        let reopened = App::with_engine(Engine::open_at(&path));
+        assert!(reopened.onboarding.is_none());
+    }
     fn fixture() -> (tempfile::TempDir, App, String) {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = Engine::open_at(&dir.path().join("workspace.db")).unwrap();
@@ -200,6 +220,13 @@ struct App {
     preview: Option<Backup>,
     chosen: HashSet<String>,
     receiver: Option<mpsc::Receiver<Result<Backup, String>>>,
+    history_receiver: Option<mpsc::Receiver<(Vec<Source>, Vec<SyncResult>, bool)>>,
+    history_sources: Vec<Source>,
+    history_results: Vec<SyncResult>,
+    history_status: String,
+    history_followup: Option<bool>,
+    onboarding: Option<usize>,
+    onboarding_started: Option<Instant>,
     notice: String,
     model: String,
     current_provider: Provider,
@@ -222,6 +249,17 @@ struct App {
 #[derive(Debug, Clone)]
 enum Msg {
     Tick,
+    SyncHistory,
+    DiscoverHistory,
+    AutoSyncHistory,
+    AutoImportHistory(bool),
+    HistorySource(SourceKind, bool),
+    HistoryFolder(SourceKind),
+    HistoryFolderPicked(SourceKind, Option<String>),
+    ResetHistoryFolder(SourceKind),
+    OnboardingStep(usize),
+    FinishOnboarding,
+    ReplayOnboarding,
     ComposerSubmit,
     ImeUpdate(bool),
     ImeCommit,
@@ -358,6 +396,32 @@ impl App {
             0.
         };
         let capture_path = std::env::var("SPARK_CODE_CAPTURE").ok();
+        let onboarding = engine
+            .as_ref()
+            .ok()
+            .filter(|e| {
+                !e.settings.onboarding_complete && e.projects.is_empty() && e.sessions.is_empty()
+            })
+            .map(|_| 0);
+        let history_receiver = engine
+            .as_ref()
+            .ok()
+            .filter(|_| capture_path.is_none())
+            .map(|e| {
+                let settings = e.settings.clone();
+                let destination = e.store.path();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let sources = local_import::discover(&settings);
+                    let results = if settings.auto_import_history {
+                        local_import::sync(sources.clone(), &settings, &destination)
+                    } else {
+                        vec![]
+                    };
+                    let _ = tx.send((sources, results, settings.auto_import_history));
+                });
+                rx
+            });
         // Look for the official CLIs on PATH in the background whenever a configured
         // path doesn't point at a real file, then check the providers once found.
         let sidebar_visible = engine
@@ -434,12 +498,31 @@ impl App {
             preview: None,
             chosen: HashSet::new(),
             receiver: None,
+            history_receiver,
+            history_sources: vec![],
+            history_results: vec![],
+            history_status: "Finding local conversation stores…".into(),
+            history_followup: None,
+            onboarding,
+            onboarding_started: onboarding.map(|_| Instant::now()),
             notice: String::new(),
             model,
         };
         // Capture-only overrides make native visual checks reproducible against an
         // isolated SPARK_CODE_DATA_DIR. They never send prompts or change history.
         if app.capture_path.is_some() {
+            if let Ok(e) = &app.engine {
+                app.history_sources = local_import::discover(&e.settings);
+                app.history_status = format!(
+                    "Found {} local conversation stores. Ready to import.",
+                    app.history_sources.iter().filter(|s| s.available()).count()
+                );
+            }
+            app.onboarding = std::env::var("SPARK_CODE_CAPTURE_ONBOARDING")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v < 3);
+            app.onboarding_started = app.onboarding.map(|_| Instant::now());
             if let Ok(tab) = std::env::var("SPARK_CODE_CAPTURE_TAB")
                 && let Some(tab) = SettingsTab::ALL.into_iter().find(|t| t.title() == tab)
             {
@@ -458,6 +541,8 @@ impl App {
     fn subscription(&self) -> Subscription<Msg> {
         let timer = if self.engine.as_ref().is_ok_and(|e| !e.jobs.is_empty())
             || self.receiver.is_some()
+            || self.history_receiver.is_some()
+            || self.onboarding_started.is_some()
             || self.probe_receiver.is_some()
             || self.detect_receiver.is_some()
             || self.theme_started.is_some()
@@ -466,7 +551,10 @@ impl App {
             || self.search_started.is_some()
         {
             iced::time::every(Duration::from_millis(
-                if self.theme_started.is_some() || self.motion_started.is_some() {
+                if self.theme_started.is_some()
+                    || self.motion_started.is_some()
+                    || self.onboarding_started.is_some()
+                {
                     16
                 } else {
                     self.engine
@@ -481,6 +569,15 @@ impl App {
         };
         Subscription::batch([
             timer,
+            if self
+                .engine
+                .as_ref()
+                .is_ok_and(|e| e.settings.auto_import_history)
+            {
+                iced::time::every(Duration::from_secs(60)).map(|_| Msg::AutoSyncHistory)
+            } else {
+                Subscription::none()
+            },
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::InputMethod(iced::advanced::input_method::Event::Preedit(
                     value,
@@ -550,6 +647,11 @@ impl App {
         }
     }
     fn update(&mut self, mut msg: Msg) -> Task<Msg> {
+        let sync_requested = matches!(msg, Msg::AutoImportHistory(true));
+        let rediscover_requested = matches!(
+            msg,
+            Msg::HistoryFolderPicked(_, Some(_)) | Msg::ResetHistoryFolder(_)
+        );
         if let Msg::SystemInfo(info) = msg {
             self.system_info = Some(info);
             return Task::none();
@@ -586,6 +688,56 @@ impl App {
             return Task::none();
         }
         match &msg {
+            Msg::HistoryFolder(kind) => {
+                let kind = *kind;
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose the conversation data folder")
+                            .pick_folder()
+                            .await
+                            .map(|p| p.path().to_string_lossy().into_owned())
+                    },
+                    move |folder| Msg::HistoryFolderPicked(kind, folder),
+                );
+            }
+            Msg::SyncHistory | Msg::DiscoverHistory | Msg::AutoSyncHistory => {
+                if self.history_receiver.is_some() {
+                    self.history_followup = Some(
+                        self.history_followup.unwrap_or(false)
+                            || !matches!(msg, Msg::DiscoverHistory),
+                    );
+                    return Task::none();
+                }
+                if self.history_receiver.is_none()
+                    && let Ok(e) = &self.engine
+                {
+                    let do_sync = !matches!(msg, Msg::DiscoverHistory);
+                    if matches!(msg, Msg::AutoSyncHistory) && !e.settings.auto_import_history {
+                        return Task::none();
+                    }
+                    let settings = e.settings.clone();
+                    let destination = e.store.path();
+                    let (tx, rx) = mpsc::channel();
+                    self.history_receiver = Some(rx);
+                    self.history_status = if do_sync {
+                        "Syncing local history…"
+                    } else {
+                        "Finding local conversation stores…"
+                    }
+                    .into();
+                    std::thread::spawn(move || {
+                        let sources = local_import::discover(&settings);
+                        let results = if do_sync {
+                            local_import::sync(sources.clone(), &settings, &destination)
+                        } else {
+                            vec![]
+                        };
+                        let _ = tx.send((sources, results, do_sync));
+                    });
+                }
+                return Task::none();
+            }
             Msg::AddProject => {
                 return Task::perform(
                     async {
@@ -698,7 +850,7 @@ impl App {
         {
             self.motion_started = Some(Instant::now());
         }
-        let reload = matches!(
+        let mut reload = matches!(
             msg,
             Msg::Select(_) | Msg::New | Msg::Send | Msg::Preference(Preference::HistoryLimit(_))
         );
@@ -711,6 +863,71 @@ impl App {
         let result: Result<(), String> = (|| {
             match msg {
                 Msg::Tick => {
+                    if self
+                        .onboarding_started
+                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(800))
+                        || e.settings.reduced_motion
+                    {
+                        self.onboarding_started = None;
+                    }
+                    if let Some(rx) = &self.history_receiver {
+                        match rx.try_recv() {
+                            Ok((sources, results, synced)) => {
+                                self.history_receiver = None;
+                                self.history_sources = sources;
+                                if synced {
+                                    let added: usize = results
+                                        .iter()
+                                        .filter_map(|r| r.result.as_ref().ok())
+                                        .map(|(n, _, _)| *n)
+                                        .sum();
+                                    let successes =
+                                        results.iter().filter(|r| r.result.is_ok()).count();
+                                    let errors =
+                                        results.iter().filter(|r| r.result.is_err()).count();
+                                    self.history_status = if results.is_empty() {
+                                        "No enabled conversation stores found. Choose a data folder below.".into()
+                                    } else {
+                                        format!(
+                                            "Synced {successes} sources · {added} new conversations{}",
+                                            if errors > 0 {
+                                                format!(" · {errors} sources need attention")
+                                            } else {
+                                                String::new()
+                                            }
+                                        )
+                                    };
+                                    if successes > 0 {
+                                        e.settings.history_last_sync = now();
+                                        e.store.save_settings(&e.settings)?;
+                                    }
+                                    self.history_results = results;
+                                    e.refresh("")?;
+                                    if !self.search.trim().is_empty() {
+                                        self.filtered_sessions =
+                                            Some(e.store.sessions(&self.search)?);
+                                    }
+                                    reload = true;
+                                    transcript_changed = true;
+                                } else {
+                                    let count = self
+                                        .history_sources
+                                        .iter()
+                                        .filter(|s| s.available())
+                                        .count();
+                                    self.history_status = format!(
+                                        "Found {count} local conversation stores. Ready to import."
+                                    );
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                self.history_receiver = None;
+                                self.history_status =
+                                    "History worker stopped. Try Sync now again.".into();
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
                     if let Some(start) = self.theme_started {
                         let t = (start.elapsed().as_secs_f32() / 0.2).min(1.);
                         let eased = t * t * (3. - 2. * t);
@@ -956,7 +1173,14 @@ impl App {
                     }
                 }
                 Msg::CancelFullAccess => self.full_access_confirmation = false,
-                Msg::Settings => self.settings = !self.settings,
+                Msg::Settings => {
+                    self.settings = !self.settings;
+                    if self.onboarding.take().is_some() {
+                        self.onboarding_started = None;
+                        e.settings.onboarding_complete = true;
+                        e.store.save_settings(&e.settings)?;
+                    }
+                }
                 Msg::SettingsTab(tab) => {
                     self.settings = true;
                     self.settings_tab = tab;
@@ -999,6 +1223,7 @@ impl App {
                     if value {
                         self.theme_started = None;
                         self.motion_started = None;
+                        self.onboarding_started = None;
                         self.theme_mix = self.theme_target;
                     }
                 }
@@ -1015,6 +1240,48 @@ impl App {
                 Msg::DismissNotice => {
                     self.notice.clear();
                     e.notice.clear();
+                }
+                Msg::OnboardingStep(step) => {
+                    self.onboarding = Some(step.min(2));
+                    self.onboarding_started = (!e.settings.reduced_motion).then(Instant::now);
+                }
+                Msg::ReplayOnboarding => {
+                    self.onboarding = Some(0);
+                    self.settings = false;
+                    self.onboarding_started = (!e.settings.reduced_motion).then(Instant::now);
+                }
+                Msg::FinishOnboarding => {
+                    e.settings.onboarding_complete = true;
+                    e.store.save_settings(&e.settings)?;
+                    self.onboarding = None;
+                    self.onboarding_started = None;
+                }
+                Msg::AutoImportHistory(value) => {
+                    e.settings.auto_import_history = value;
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::HistorySource(kind, value) => {
+                    match kind {
+                        SourceKind::Codex => e.settings.history_codex = value,
+                        SourceKind::T3 => e.settings.history_t3 = value,
+                    }
+                    e.store.save_settings(&e.settings)?;
+                }
+                Msg::HistoryFolderPicked(kind, folder) => {
+                    if let Some(folder) = folder {
+                        match kind {
+                            SourceKind::Codex => e.settings.codex_history_dir = folder,
+                            SourceKind::T3 => e.settings.t3_history_dir = folder,
+                        }
+                        e.store.save_settings(&e.settings)?;
+                    }
+                }
+                Msg::ResetHistoryFolder(kind) => {
+                    match kind {
+                        SourceKind::Codex => e.settings.codex_history_dir.clear(),
+                        SourceKind::T3 => e.settings.t3_history_dir.clear(),
+                    }
+                    e.store.save_settings(&e.settings)?;
                 }
                 Msg::QuickPrompt(value) => {
                     self.prompt = value;
@@ -1237,6 +1504,10 @@ impl App {
                 | Msg::ComposerSubmit => {}
                 Msg::SystemInfo(_) | Msg::RefreshDiagnostics => {}
                 Msg::AddProject | Msg::ImportFile | Msg::Export => {}
+                Msg::SyncHistory
+                | Msg::DiscoverHistory
+                | Msg::AutoSyncHistory
+                | Msg::HistoryFolder(_) => {}
             }
             Ok(())
         })();
@@ -1248,6 +1519,21 @@ impl App {
         }
         if transcript_changed {
             self.cache_markdown();
+        }
+        if sync_requested {
+            return Task::done(Msg::SyncHistory);
+        }
+        if rediscover_requested {
+            return Task::done(Msg::DiscoverHistory);
+        }
+        if self.history_receiver.is_none()
+            && let Some(sync) = self.history_followup.take()
+        {
+            return Task::done(if sync {
+                Msg::SyncHistory
+            } else {
+                Msg::DiscoverHistory
+            });
         }
         if std::mem::take(&mut self.auto_probe) {
             return Task::done(Msg::ProbeAll);

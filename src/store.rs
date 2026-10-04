@@ -28,6 +28,85 @@ impl Store {
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA cache_size=-1024; CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,title TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,remote_id TEXT,updated INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),role TEXT NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS message_session ON messages(session_id,created); CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL);").map_err(|e|e.to_string())?;
         Ok(Self { db })
     }
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(self.db.path().unwrap_or_default())
+    }
+
+    /// Update only records owned by this linked source. Local replies are never replaced.
+    pub fn sync_history(&mut self, source: &str, b: &Backup) -> Result<usize, String> {
+        crate::import::validate(b)?;
+        let prefix = format!("linked:{source}:");
+        if b.projects.iter().any(|p| !p.id.starts_with(&prefix))
+            || b.sessions.iter().any(|s| !s.id.starts_with(&prefix))
+            || b.messages.iter().any(|m| !m.id.starts_with(&prefix))
+        {
+            return Err("Invalid linked history namespace".into());
+        }
+        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS linked_history(entity TEXT NOT NULL,id TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(entity,id));")
+            .map_err(|e| e.to_string())?;
+        let claim = |entity: &str, id: &str| -> Result<(), String> {
+            let table = match entity {
+                "project" => "projects",
+                "session" => "sessions",
+                _ => "messages",
+            };
+            let exists: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM linked_history WHERE entity=?1 AND id=?2",
+                    params![entity, id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if exists && owner.as_deref() != Some(source) {
+                return Err("Linked history conflicts with an existing local record".into());
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO linked_history VALUES(?1,?2,?3)",
+                params![entity, id, source],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        };
+        for p in &b.projects {
+            claim("project", &p.id)?;
+            tx.execute("INSERT INTO projects VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path", params![p.id,p.name,p.path]).map_err(|e| e.to_string())?;
+        }
+        let mut added = 0;
+        for s in &b.sessions {
+            claim("session", &s.id)?;
+            added += tx
+                .execute(
+                    "INSERT OR IGNORE INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        s.id,
+                        s.project_id,
+                        s.title,
+                        serde_json::to_string(&s.provider).map_err(|e| e.to_string())?,
+                        s.model,
+                        s.remote_id,
+                        s.updated
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            // Preserve locally continued sessions, including their selected provider/model.
+            tx.execute("UPDATE sessions SET updated=MAX(updated,?2),title=CASE WHEN remote_id IS NULL AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.session_id=sessions.id AND NOT EXISTS(SELECT 1 FROM linked_history l WHERE l.entity='message' AND l.id=m.id)) THEN ?3 ELSE title END WHERE id=?1", params![s.id,s.updated,s.title]).map_err(|e| e.to_string())?;
+        }
+        for m in &b.messages {
+            claim("message", &m.id)?;
+            tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET text=excluded.text,created=excluded.created", params![m.id,m.session_id,m.role,m.text,m.created]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(added)
+    }
     pub fn projects(&self) -> Result<Vec<Project>, String> {
         let mut st = self
             .db
@@ -80,7 +159,7 @@ impl Store {
         self.messages_limit(id, VISIBLE_MESSAGES)
     }
     pub fn messages_limit(&self, id: &str, limit: usize) -> Result<Vec<Message>, String> {
-        let mut st=self.db.prepare("SELECT id,session_id,role,text,created FROM (SELECT rowid,id,session_id,role,text,created FROM messages WHERE session_id=?1 ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid").map_err(|e|e.to_string())?;
+        let mut st=self.db.prepare("SELECT id,session_id,role,text,created FROM (SELECT rowid,id,session_id,role,text,created FROM messages WHERE session_id=?1 ORDER BY created DESC,rowid DESC LIMIT ?2) ORDER BY created,rowid").map_err(|e|e.to_string())?;
         st.query_map(params![id, limit as i64], |r| {
             Ok(Message {
                 id: r.get(0)?,

@@ -1,4 +1,4 @@
-//! Explicit user-selected imports only. Nothing in this module discovers account files.
+//! Previewed file imports. Opt-in live database discovery and sync live in `local_import`.
 use crate::model::*;
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::HashSet, fs::File, io::Read, path::Path};
